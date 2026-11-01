@@ -1,0 +1,68 @@
+# Shared security checks, called from each repository's own workflow:
+#
+#   security:
+#     uses: Hugo-SEQUIER/ci-workflows/.github/workflows/security.yml@v1
+#     with:
+#       runs-on: '["self-hosted","<repo label>"]'
+#
+# secrets       gitleaks over the commits the push or pull request adds (blocking)
+# dependencies  osv-scanner over every lockfile; a pull request fails only for a vulnerable
+#               dependency it adds, older findings are listed in the run summary (report only)
+#
+# Tools are pinned and checksum-verified in scripts/install-tool.sh and cached per runner.
+name: security
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON array of runner labels, for example '["self-hosted","gta6"]'
+        type: string
+        required: true
+      ci-ref:
+        description: Ref of Hugo-SEQUIER/ci-workflows whose scripts to use; keep it equal to the ref in `uses:`
+        type: string
+        default: v1
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: secrets (gitleaks)
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: Hugo-SEQUIER/ci-workflows
+          ref: ${{ inputs.ci-ref }}
+          path: .ci-workflows
+      - run: .ci-workflows/scripts/install-tool.sh gitleaks
+      - name: Scan the new commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: .ci-workflows/scripts/gitleaks-range.sh "$BASE" "$HEAD"
+
+  dependencies:
+    name: dependencies (osv-scanner)
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: Hugo-SEQUIER/ci-workflows
+          ref: ${{ inputs.ci-ref }}
+          path: .ci-workflows
+      - run: .ci-workflows/scripts/install-tool.sh osv-scanner
+      - name: Check dependencies for known vulnerabilities
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: .ci-workflows/scripts/osv-check.sh "$BASE"
