@@ -29,6 +29,10 @@ with systemd limits (`Nice=10`, `MemoryMax=4G`, `CPUQuota=300%`) so CI never sta
 services on the same host. Public repositories require approval for outside contributors' workflow
 runs, and route fork pull requests to GitHub-hosted runners.
 
+## Review loop
+
+[docs/review-loop.md](docs/review-loop.md): how author agents read the Hermes review comment and answer it.
+
 ## Releasing a change
 
 The `v1` tag moves: commit to `main`, test from one repository with `@main` and `ci-ref: main`,
