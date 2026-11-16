@@ -1,7 +1,7 @@
 # ci-workflows
 
-Shared GitHub workflows for Hugo-SEQUIER's repositories. Every job runs on the calling
-repository's own self-hosted runner on Hugo's server, never on GitHub's hosted machines.
+Shared GitHub workflows for Hugo-SEQUIER's repositories. Jobs run on the runner the caller
+names in `runs-on`, normally the repository's own self-hosted runner on Hugo's server.
 
 ## Security checks
 
@@ -21,6 +21,22 @@ jobs:
   that has a `reason`.
 
 Tool versions and SHA-256 checksums are pinned in `scripts/install-tool.sh`.
+
+## Stale references
+
+```yaml
+jobs:
+  stale-refs:
+    uses: Hugo-SEQUIER/ci-workflows/.github/workflows/stale-refs.yml@v1
+    with:
+      runs-on: '["self-hosted","<repo label>"]'
+```
+
+Flags a test or doc line that still uses a name, CSS class, route or UI string the pull request
+removed from the code, for example an e2e test that still clicks a deleted button. Only what the
+pull request removed is checked, so older drift is never reported. It reads git objects only and
+never runs the repository's code. Findings are warnings until the caller sets `fail: true`.
+Silence one line with `stale-refs: ignore`; changelogs and decision logs are skipped.
 
 ## Runners
 
