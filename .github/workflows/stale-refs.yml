@@ -1,0 +1,55 @@
+# Stale references: fail a pull request that removes a name, CSS class, route or UI string from
+# the code while a test or doc still uses it. Called from each repository's own workflow:
+#
+#   stale-refs:
+#     uses: Hugo-SEQUIER/ci-workflows/.github/workflows/stale-refs.yml@main
+#     with:
+#       runs-on: '["self-hosted","<repo label>"]'   # or '["ubuntu-latest"]'
+#       ci-ref: main
+#
+# Only what the pull request removed is checked, so older drift is never reported. Changelogs and
+# decision logs are skipped. A line that must keep an old name carries `stale-refs: ignore`.
+# Findings are warnings on the pull request's lines until `fail: true` makes them block.
+# The check reads git objects only: it never installs or runs the repository's code.
+name: stale-refs
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON array of runner labels, for example '["self-hosted","gta6"]'
+        type: string
+        required: true
+      ci-ref:
+        description: Ref of Hugo-SEQUIER/ci-workflows whose scripts to use; keep it equal to the ref in `uses:`
+        type: string
+        default: v1
+      fail:
+        description: Fail the run on a stale reference instead of only annotating the lines
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  stale-refs:
+    name: stale references
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: Hugo-SEQUIER/ci-workflows
+          ref: ${{ inputs.ci-ref }}
+          path: .ci-workflows
+      - name: Tests and docs still using what this pull request removed
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          FAIL: ${{ inputs.fail && '--fail' || '' }}
+        run: python3 .ci-workflows/scripts/stale_refs.py $FAIL "$BASE" "$HEAD"
