@@ -41,10 +41,6 @@ NEGATION = re.compile(
     re.I,
 )
 SELECTOR = re.compile(r"(?<![\w-])\.([A-Za-z][\w-]{2,})")
-COMMON = {
-    "true", "false", "null", "none", "undefined", "return", "const", "import", "export", "from",
-    "function", "class", "self", "this", "async", "await", "default", "string", "number",
-}
 DOC = re.compile(r"\.(md|mdx|rst)$", re.I)
 # Records of the past keep old names on purpose.
 HISTORY = re.compile(r"(^|/)(CHANGELOG|CHANGES|HISTORY|DECISIONS|RELEASES?)[^/]*$|(^|/)(adr|decisions|changelog)/", re.I)
