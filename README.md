@@ -38,6 +38,27 @@ pull request removed is checked, so older drift is never reported. It reads git 
 never runs the repository's code. Findings are warnings until the caller sets `fail: true`.
 Silence one line with `stale-refs: ignore`; changelogs and decision logs are skipped.
 
+## Checks
+
+```yaml
+jobs:
+  check:
+    uses: Hugo-SEQUIER/ci-workflows/.github/workflows/check.yml@v1
+    with:
+      runs-on: '["self-hosted","<repo label>"]'
+      command: just check
+      uv-version: "0.12.21"
+      node-version: "24"
+      bun-version: "1.4.2"
+      report: check-report.sarif
+```
+
+Installs the toolchains whose version the caller sets (uv, Node, Bun) and runs the project's check
+command in `working-directory` (default: the repository root). The checks themselves live in the
+project. When `report` is set, the file is kept as the `check-report` artifact of the run, also
+when the command fails. A service the project needs, such as Postgres, stays in a job of the
+project's own workflow.
+
 ## Runners
 
 One runner per repository, each as its own Linux user (`gha-<label>`, no sudo, no Docker group),
