@@ -1,0 +1,81 @@
+# Shared check job: install the toolchains a project names and run its check command, called
+# from each repository's own workflow:
+#
+#   check:
+#     uses: Hugo-SEQUIER/ci-workflows/.github/workflows/check.yml@v1
+#     with:
+#       runs-on: '["self-hosted","<repo label>"]'
+#       command: just check
+#       uv-version: "0.12.21"        # each toolchain is installed only when its version is set
+#       report: check-report.sarif   # optional, kept as the run's `check-report` artifact
+#
+# The language knowledge stays in the project: this job knows the toolchains, not the checks.
+# A service the project needs, such as a database, stays in the project's own job.
+name: check
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON array of runner labels, for example '["self-hosted","gta6"]'
+        type: string
+        required: true
+      command:
+        description: The project's check command, run with bash in `working-directory`
+        type: string
+        required: true
+      working-directory:
+        description: Folder to run the command in, relative to the repository root
+        type: string
+        default: .
+      uv-version:
+        description: uv version to install, for example "0.12.21"; empty installs no uv
+        type: string
+        default: ""
+      node-version:
+        description: Node version to install, for example "24"; empty installs no Node
+        type: string
+        default: ""
+      bun-version:
+        description: Bun version to install, for example "1.4.2"; empty installs no Bun
+        type: string
+        default: ""
+      report:
+        description: Report file the command writes, relative to the repository root; empty keeps none
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - if: inputs.uv-version != ''
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ inputs.uv-version }}
+      - if: inputs.node-version != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - if: inputs.bun-version != ''
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun-version }}
+      - name: Check command
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          COMMAND: ${{ inputs.command }}
+        run: bash -euo pipefail -c "$COMMAND"
+      # Kept on failure too: the report says which check failed.
+      - if: always() && inputs.report != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-report
+          path: ${{ inputs.report }}
+          if-no-files-found: warn
