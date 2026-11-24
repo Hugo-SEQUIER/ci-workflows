@@ -1,0 +1,75 @@
+# Hugo's general instructions: function and module comments use exactly the labels Parameters,
+# What it does and Output. One rule per language (ids must differ): Python docstrings and
+# TypeScript block comments.
+id: comment-labels-python
+language: Python
+severity: error
+message: 'Function and module comments use exactly the labels `Parameters:`, `What it does:` and `Output:`, once each and in that order. Rename the label (`Args:` becomes `Parameters:`, `Returns:` becomes `Output:`; `make fix` renames these two) and put the rest in plain sentences.'
+rule:
+  pattern: $DOC
+  kind: string
+  inside:
+    kind: expression_statement
+  any:
+    - regex: '(?m)^[ \t*/"''rR]*(?:(?:Args|Arguments|Params?|Inputs?|Outputs|Returns?|Yields?|Raises|Description|Purpose|Examples?|Notes?):|[:@](?:param|returns?|rtype|raises)\b)'
+    - regex: '(?ms)^[ \t*/"''rR]*(?:Output:.*^[ \t*]*(?:Parameters|What it does):|What it does:.*^[ \t*]*Parameters:|Parameters:.*^[ \t*]*Parameters:|What it does:.*^[ \t*]*What it does:|Output:.*^[ \t*]*Output:)'
+transform:
+  WITH_PARAMETERS:
+    replace:
+      source: $DOC
+      replace: '(?m)^([ \t*/"''rR]*)(?:Args|Arguments|Params?):'
+      by: '${1}Parameters:'
+  RENAMED:
+    replace:
+      source: $WITH_PARAMETERS
+      replace: '(?m)^([ \t*/"''rR]*)Returns?:'
+      by: '${1}Output:'
+fix: $RENAMED
+---
+id: comment-labels-typescript
+language: TypeScript
+severity: error
+message: 'Function and module comments use exactly the labels `Parameters:`, `What it does:` and `Output:`, once each and in that order. Rename the label (`Args:` becomes `Parameters:`, `Returns:` becomes `Output:`; `make fix` renames these two) and put the rest in plain sentences.'
+rule:
+  pattern: $DOC
+  kind: comment
+  regex: '^/\*'
+  any:
+    - regex: '(?m)^[ \t*/"''rR]*(?:(?:Args|Arguments|Params?|Inputs?|Outputs|Returns?|Yields?|Raises|Description|Purpose|Examples?|Notes?):|[:@](?:param|returns?|rtype|raises)\b)'
+    - regex: '(?ms)^[ \t*/"''rR]*(?:Output:.*^[ \t*]*(?:Parameters|What it does):|What it does:.*^[ \t*]*Parameters:|Parameters:.*^[ \t*]*Parameters:|What it does:.*^[ \t*]*What it does:|Output:.*^[ \t*]*Output:)'
+transform:
+  WITH_PARAMETERS:
+    replace:
+      source: $DOC
+      replace: '(?m)^([ \t*/"''rR]*)(?:Args|Arguments|Params?):'
+      by: '${1}Parameters:'
+  RENAMED:
+    replace:
+      source: $WITH_PARAMETERS
+      replace: '(?m)^([ \t*/"''rR]*)Returns?:'
+      by: '${1}Output:'
+fix: $RENAMED
+---
+id: comment-labels-tsx
+language: Tsx
+severity: error
+message: 'Function and module comments use exactly the labels `Parameters:`, `What it does:` and `Output:`, once each and in that order. Rename the label (`Args:` becomes `Parameters:`, `Returns:` becomes `Output:`; `make fix` renames these two) and put the rest in plain sentences.'
+rule:
+  pattern: $DOC
+  kind: comment
+  regex: '^/\*'
+  any:
+    - regex: '(?m)^[ \t*/"''rR]*(?:(?:Args|Arguments|Params?|Inputs?|Outputs|Returns?|Yields?|Raises|Description|Purpose|Examples?|Notes?):|[:@](?:param|returns?|rtype|raises)\b)'
+    - regex: '(?ms)^[ \t*/"''rR]*(?:Output:.*^[ \t*]*(?:Parameters|What it does):|What it does:.*^[ \t*]*Parameters:|Parameters:.*^[ \t*]*Parameters:|What it does:.*^[ \t*]*What it does:|Output:.*^[ \t*]*Output:)'
+transform:
+  WITH_PARAMETERS:
+    replace:
+      source: $DOC
+      replace: '(?m)^([ \t*/"''rR]*)(?:Args|Arguments|Params?):'
+      by: '${1}Parameters:'
+  RENAMED:
+    replace:
+      source: $WITH_PARAMETERS
+      replace: '(?m)^([ \t*/"''rR]*)Returns?:'
+      by: '${1}Output:'
+fix: $RENAMED

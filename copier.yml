@@ -1,0 +1,24 @@
+# Project template for the factory (docs in README.md#project-template). Copier renders the
+# template/ folder; `copier update` brings later template versions into a project.
+_subdirectory: template
+_min_copier_version: "9.4"
+
+project_name:
+  type: str
+  help: Name of the repository
+
+runner_label:
+  type: str
+  default: "{{ project_name }}"
+  help: Label of the repository's self-hosted runner
+
+typescript:
+  type: bool
+  default: false
+  help: Does the project have TypeScript code?
+
+typescript_folder:
+  type: str
+  default: web
+  when: "{{ typescript }}"
+  help: Folder of the TypeScript code and its tsconfig.json, relative to the root ("." for the root)

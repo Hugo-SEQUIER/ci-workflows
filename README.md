@@ -59,6 +59,23 @@ project. When `report` is set, the file is kept as the `check-report` artifact o
 when the command fails. A service the project needs, such as Postgres, stays in a job of the
 project's own workflow.
 
+## Project template
+
+`copier.yml` and `template/` make a project ready for the factory: the `make check`, `make fix` and
+`make verify` commands (`scripts/check.py` holds the checks, their fixes and the tool versions),
+the Ruff configuration, Biome for TypeScript, ast-grep checks in `checks/shared/` (from the
+template) and `checks/project/` (the project's own), the CI caller of the three workflows above,
+and an `AGENTS.md` that routes. Python and TypeScript; uv is needed, and Bun for TypeScript.
+
+```bash
+uvx copier copy gh:Hugo-SEQUIER/ci-workflows <folder>   # asks the name, the runner label, TypeScript
+uvx copier update                                       # in the project: the newest template version
+```
+
+`copier update` merges the template's changes into the project's own edits; a line both changed
+shows as a git conflict (`<<<<<<< before updating`), and `make check` fails until it is resolved.
+The version a project has is `_commit` in its `.copier-answers.yml`.
+
 ## Runners
 
 One runner per repository, each as its own Linux user (`gha-<label>`, no sudo, no Docker group),
@@ -74,3 +91,9 @@ runs, and route fork pull requests to GitHub-hosted runners.
 
 The `v1` tag moves: commit to `main`, test from one repository with `@main` and `ci-ref: main`,
 then `git tag -f v1 && git push -f origin v1`. A breaking change gets `v2`.
+
+A change to `template/` also gets a fixed, annotated version tag, which `copier update` reads:
+`git tag -a v1.<n>.0 -m "template 1.<n>.0" && git push origin v1.<n>.0`. The moving `v1` stays a
+lightweight tag. When both tags are on one commit, git names the commit by the annotated one, so a
+project records `v1.<n>.0` and not `v1`; a project that recorded the moving `v1` could not be
+updated, because `v1` would no longer point at the version it was made from.
