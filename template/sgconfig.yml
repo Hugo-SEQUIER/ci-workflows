@@ -1,0 +1,4 @@
+# ast-grep checks of `make check`: the shared ones from the template, and this project's own.
+ruleDirs:
+  - checks/shared
+  - checks/project

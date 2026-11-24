@@ -1,0 +1,219 @@
+"""Run the checks of `make check` and write the check report, or apply their fixes.
+
+Parameters:
+    --report: path of the report file (default: check-report.json at the repository root).
+    --skip KEY, --only KEY: leave out these checks, or run only these.
+    --fix: apply the automatic fixes of Ruff, Biome and ast-grep instead of checking.
+
+What it does:
+    Runs Ruff lint and format, the ast-grep checks of checks/, and when the project has
+    TypeScript, Biome and the TypeScript checker (once its folder has a tsconfig.json). Reads
+    each tool's output into Cladeo's report format (docs/factory/CHECKS.md in
+    Hugo-SEQUIER/systems): one entry per check with its key, statement, kind, status, and for a
+    failure the file, line and message. A tool that fails without a
+    readable result is reported as a failure, never as a pass. A project adds its own checks,
+    such as its tests, to CHECKS.
+
+Output:
+    Writes the report, prints one line per failure and a summary. Exits with 1 if any check fails.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+# None when the project has no TypeScript.
+TYPESCRIPT_FOLDER = {{ (typescript_folder if typescript else none) | tojson | replace("null", "None") }}
+RUFF = ["uvx", "ruff@0.17.6"]
+BIOME = ["bunx", "@biomejs/biome@2.6.8"]
+AST_GREP = ["uvx", "--from", "ast-grep-cli@0.51.3", "ast-grep"]
+TSC_ERROR = re.compile(r"^(?P<file>[^(\s][^(]*)\((?P<line>\d+),\d+\): error (?P<message>.+)$")
+
+
+def run(command: list[str], cwd: Path = ROOT) -> subprocess.CompletedProcess:
+    """Parameters: the command and its folder.
+    What it does: runs the command and captures its output. A command that cannot start, such as a
+    missing tool, gets exit code 127 and the error as its output.
+    Output: the finished process."""
+    try:
+        return subprocess.run(command, check=False, cwd=cwd, capture_output=True, text=True)
+    except OSError as error:
+        return subprocess.CompletedProcess(command, 127, "", str(error))
+
+
+def unreadable(result: subprocess.CompletedProcess) -> list[dict]:
+    """Parameters: a finished process whose output could not be read.
+    What it does: turns the end of its output into one failure, so the check cannot pass.
+    Output: a list with one failure."""
+    output = (result.stderr or result.stdout).strip().splitlines() or ["no output"]
+    return [{"file": None, "line": None, "message": f"exit {result.returncode}: {output[-1]}"}]
+
+
+def ruff(args: list[str], rule_codes: bool = True) -> list[dict]:
+    """Parameters: the Ruff subcommand and its options; whether findings carry a lint rule code.
+    What it does: runs Ruff on the repository with JSON output.
+    Output: one failure per Ruff finding, with the rule code first in the message when there is one."""
+    result = run([*RUFF, *args, "--output-format", "json", "."])
+    try:
+        findings = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return unreadable(result)
+    if result.returncode != 0 and not findings:
+        return unreadable(result)
+    return [
+        {
+            "file": str(Path(f["filename"]).resolve().relative_to(ROOT)),
+            "line": f["location"]["row"],
+            "message": f"{f['code']} {f['message']}" if rule_codes else f["message"],
+        }
+        for f in findings
+    ]
+
+
+def biome() -> list[dict]:
+    """Parameters: none.
+    What it does: runs Biome lint and format checks on the files biome.json includes.
+    Output: one failure per Biome error, with its rule first in the message. Biome's information
+    and warnings do not fail the check, as they do not fail `biome ci`."""
+    result = run([*BIOME, "ci", "--colors=off", "--reporter=rdjson", "--no-errors-on-unmatched", "."])
+    try:
+        diagnostics = json.loads(result.stdout)["diagnostics"]
+    except (json.JSONDecodeError, KeyError):
+        return unreadable(result)
+    findings = [d for d in diagnostics if d.get("severity") == "ERROR"]
+    if result.returncode != 0 and not findings:
+        return unreadable(result)
+    return [
+        {
+            "file": f.get("location", {}).get("path"),
+            "line": f.get("location", {}).get("range", {}).get("start", {}).get("line"),
+            "message": f"{f.get('code', {}).get('value', 'format')} {f['message']}",
+        }
+        for f in findings
+    ]
+
+
+def typescript_types() -> list[dict]:
+    """Parameters: none.
+    What it does: installs the dependencies from the lockfile and runs the TypeScript checker in
+    TYPESCRIPT_FOLDER.
+    Output: one failure per TypeScript error."""
+    folder = ROOT / TYPESCRIPT_FOLDER
+    install = run(["bun", "install", "--frozen-lockfile"], cwd=folder)
+    if install.returncode != 0:
+        return unreadable(install)
+    result = run(["bunx", "tsc", "--noEmit", "--pretty", "false"], cwd=folder)
+    prefix = "" if TYPESCRIPT_FOLDER == "." else f"{TYPESCRIPT_FOLDER}/"
+    failures = [
+        {"file": prefix + m["file"], "line": int(m["line"]), "message": m["message"]}
+        for m in map(TSC_ERROR.match, result.stdout.splitlines())
+        if m
+    ]
+    if result.returncode != 0 and not failures:
+        return unreadable(result)
+    return failures
+
+
+def ast_grep() -> list[dict]:
+    """Parameters: none.
+    What it does: runs the ast-grep checks of checks/shared and checks/project (sgconfig.yml).
+    Output: one failure per match, with the check's id first in the message."""
+    result = run([*AST_GREP, "scan", "--json=stream", "."])
+    try:
+        matches = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    except json.JSONDecodeError:
+        return unreadable(result)
+    if result.returncode != 0 and not matches:
+        return unreadable(result)
+    return [
+        {
+            "file": m["file"],
+            "line": m["range"]["start"]["line"] + 1,
+            "message": f"{m['ruleId']} {m['message']}",
+        }
+        for m in matches
+    ]
+
+
+CHECKS = [
+    ("ruff-lint", "Ruff finds no lint error", "lint", lambda: ruff(["check"])),
+    (
+        "ruff-format",
+        "The Python files are formatted as Ruff formats them",
+        "lint",
+        lambda: ruff(["format", "--check"], rule_codes=False),
+    ),
+    ("ast-grep", "No file breaks a check of checks/", "lint", ast_grep),
+]
+# ast-grep first, so that the formatters tidy the lines its fixes leave.
+FIXES = [
+    [*AST_GREP, "scan", "--update-all", "."],
+    [*RUFF, "check", "--fix", "--exit-zero", "."],
+    [*RUFF, "format", "."],
+]
+# A TypeScript folder without tsconfig.json has no types to check yet; main says so.
+NO_TSCONFIG = TYPESCRIPT_FOLDER is not None and not (ROOT / TYPESCRIPT_FOLDER / "tsconfig.json").exists()
+if TYPESCRIPT_FOLDER is not None:
+    CHECKS.append(("biome", "Biome finds no lint or format error in the TypeScript files", "lint", biome))
+    FIXES.append([*BIOME, "check", "--write", "--no-errors-on-unmatched", "."])
+if TYPESCRIPT_FOLDER is not None and not NO_TSCONFIG:
+    statement = f"The TypeScript checker finds no error in {TYPESCRIPT_FOLDER}/"
+    CHECKS.append(("ts-types", statement, "types", typescript_types))
+KEYS = [key for key, *_ in CHECKS]
+
+
+def fix() -> None:
+    """Parameters: none.
+    What it does: runs each command of FIXES. What a fix cannot repair stays for check to report.
+    Output: prints the exit code of each command."""
+    for command in FIXES:
+        result = run(command)
+        print(f"{' '.join(command)}: exit {result.returncode}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run the checks of make check and write the report.")
+    parser.add_argument("--report", type=Path, default=ROOT / "check-report.json", help="report file")
+    parser.add_argument("--fix", action="store_true", help="apply the automatic fixes instead")
+    chosen = parser.add_mutually_exclusive_group()
+    chosen.add_argument("--skip", action="append", choices=KEYS, default=[], help="leave out this check")
+    chosen.add_argument("--only", action="append", choices=KEYS, default=[], help="run only this check")
+    args = parser.parse_args()
+    if args.fix:
+        fix()
+        return 0
+
+    checks = []
+    for key, statement, kind, find in CHECKS:
+        if key in args.skip or (args.only and key not in args.only):
+            continue
+        failures = find()
+        checks.append(
+            {
+                "key": key,
+                "statement": statement,
+                "kind": kind,
+                "status": "fail" if failures else "pass",
+                "failures": failures,
+            }
+        )
+        for failure in failures:
+            place = ":".join(str(part) for part in (failure["file"], failure["line"]) if part is not None)
+            print(f"{key}: {place + ': ' if place else ''}{failure['message']}")
+    args.report.write_text(json.dumps({"version": 1, "checks": checks}, indent=2) + "\n")
+
+    failed = [check["key"] for check in checks if check["status"] == "fail"]
+    print(f"{len(checks)} checks, {len(failed)} failed{': ' + ', '.join(failed) if failed else ''}")
+    if args.skip:
+        print(f"Skipped: {', '.join(args.skip)}")
+    if NO_TSCONFIG:
+        print(f"Not run: ts-types, because {TYPESCRIPT_FOLDER}/ has no tsconfig.json yet.")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

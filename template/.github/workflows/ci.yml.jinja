@@ -1,0 +1,43 @@
+# Checks for every pull request and every push to main, through the shared workflows of
+# Hugo-SEQUIER/ci-workflows. A job the project alone needs, such as tests with a database, goes
+# below them.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels its older run; other runs are never cancelled, so
+# gitleaks scans every push to main.
+concurrency:
+{%- raw %}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+{%- endraw %}
+
+jobs:
+  check:
+    uses: Hugo-SEQUIER/ci-workflows/.github/workflows/check.yml@v1
+    with:
+      runs-on: '["self-hosted","{{ runner_label }}"]'
+      uv-version: "0.12.21"
+{%- if typescript %}
+      bun-version: "1.4.2"
+{%- endif %}
+      command: make check
+      report: check-report.json
+
+  security:
+    uses: Hugo-SEQUIER/ci-workflows/.github/workflows/security.yml@v1
+    with:
+      runs-on: '["self-hosted","{{ runner_label }}"]'
+
+  stale-refs:
+    uses: Hugo-SEQUIER/ci-workflows/.github/workflows/stale-refs.yml@v1
+    with:
+      runs-on: '["self-hosted","{{ runner_label }}"]'

@@ -1,0 +1,14 @@
+# {{ project_name }}
+
+## Commands
+- `make check`: every check; writes `check-report.json`. CI runs the same command.
+- `make fix`: applies the automatic fixes that `make check` asks for.
+- `make verify`: `make check`, then the proof in `proof/`.
+
+## Where things are
+- `scripts/check.py`: the checks of `make check`, their fixes and the tool versions. A check of this project, such as its tests, is added there.
+- `checks/shared/`: the ast-grep checks of the template. They are changed in `Hugo-SEQUIER/ci-workflows`, then `uvx copier update`.
+- `checks/project/`: the ast-grep checks of this project only.
+- `ruff.toml`{% if typescript %}, `biome.json`{% endif %}: lint and format configuration.
+- `.github/workflows/ci.yml`: CI, which calls the shared workflows of `Hugo-SEQUIER/ci-workflows`.
+- `.copier-answers.yml`: the template version and answers, for `uvx copier update`.
