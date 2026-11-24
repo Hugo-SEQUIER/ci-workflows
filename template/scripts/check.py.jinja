@@ -6,8 +6,10 @@ Parameters:
     --fix: apply the automatic fixes of Ruff, Biome and ast-grep instead of checking.
 
 What it does:
-    Runs Ruff lint and format, the ast-grep checks of checks/, and when the project has
-    TypeScript, Biome and the TypeScript checker (once its folder has a tsconfig.json). Reads
+    Runs Ruff lint and format, the ast-grep checks of checks/, the setup checks (the project was
+    made from this template, has its commands, calls its workflows, and its AGENTS.md states no
+    written rule), and when the project has TypeScript, Biome and the TypeScript checker (once
+    its folder has a tsconfig.json). Reads
     each tool's output into Cladeo's report format (docs/factory/CHECKS.md in
     Hugo-SEQUIER/systems): one entry per check with its key, statement, kind, status, and for a
     failure the file, line and message. A tool that fails without a
@@ -139,6 +141,87 @@ def ast_grep() -> list[dict]:
     ]
 
 
+# The setup checks show the project was set up from this template (docs/factory/CHECKS.md, "How a
+# project enters the factory", in Hugo-SEQUIER/systems). Cladeo's setup path asks for their keys.
+TEMPLATE = "Hugo-SEQUIER/ci-workflows"
+FIXED_TAG = re.compile(r"^v\d+\.\d+\.\d+$")
+WORKFLOWS = ("check.yml", "security.yml")
+WRITTEN_RULE = re.compile(r"\b(?:do not|don't|never|always|must)\b", re.IGNORECASE)
+JUDGMENT = "<!-- judgment:"
+
+
+def failure(path: str, message: str) -> dict:
+    """Parameters: a file of the repository and what is wrong with it.
+    What it does: builds one failure of a setup check, which names no line.
+    Output: the failure."""
+    return {"file": path, "line": None, "message": message}
+
+
+def setup_template() -> list[dict]:
+    """Parameters: none.
+    What it does: reads .copier-answers.yml, which copier writes, for the template it came from
+    and the version it was made or last updated from.
+    Output: a failure when the file is missing, names another template, or a version that is not
+    a fixed tag such as v1.2.0."""
+    path = ROOT / ".copier-answers.yml"
+    if not path.exists():
+        return [failure(path.name, f"No {path.name}: make the project with uvx copier copy gh:{TEMPLATE}")]
+    answers = dict(re.findall(r"^(_src_path|_commit): *['\"]?(.*?)['\"]?$", path.read_text(), re.MULTILINE))
+    failures = []
+    if TEMPLATE not in answers.get("_src_path", ""):
+        failures.append(failure(path.name, f"_src_path does not name {TEMPLATE}"))
+    if not FIXED_TAG.match(answers.get("_commit", "")):
+        failures.append(failure(path.name, "_commit is not a fixed tag such as v1.2.0: copier update"))
+    return failures
+
+
+def setup_commands() -> list[dict]:
+    """Parameters: none.
+    What it does: reads the Makefile for the check, fix and verify targets.
+    Output: one failure per missing target."""
+    path = ROOT / "Makefile"
+    targets = set(re.findall(r"^([a-z]+):", path.read_text(), re.MULTILINE)) if path.exists() else set()
+    return [
+        failure("Makefile", f"No `{name}` target")
+        for name in ("check", "fix", "verify")
+        if name not in targets
+    ]
+
+
+def setup_workflows() -> list[dict]:
+    """Parameters: none.
+    What it does: reads the CI caller file for the shared workflows of the template.
+    Output: one failure per shared workflow it does not call."""
+    path = ROOT / ".github" / "workflows" / "ci.yml"
+    text = path.read_text() if path.exists() else ""
+    return [
+        failure(".github/workflows/ci.yml", f"Does not call {TEMPLATE}/.github/workflows/{name}")
+        for name in WORKFLOWS
+        if f"uses: {TEMPLATE}/.github/workflows/{name}@" not in text
+    ]
+
+
+def setup_agents_md() -> list[dict]:
+    """Parameters: none.
+    What it does: reads AGENTS.md for written rules: lines with "do not", "never", "always" or
+    "must". A rule should be a check; a line that needs judgment stays when it carries
+    `<!-- judgment: why -->`.
+    Output: one failure per written rule, or one when AGENTS.md is missing."""
+    path = ROOT / "AGENTS.md"
+    if not path.exists():
+        return [failure("AGENTS.md", "No AGENTS.md: it routes agents to the commands and files")]
+    return [
+        {
+            "file": "AGENTS.md",
+            "line": number,
+            "message": "A written rule: make it a check in checks/project/, or mark it "
+            "<!-- judgment: why --> when no script can verify it",
+        }
+        for number, line in enumerate(path.read_text().splitlines(), 1)
+        if WRITTEN_RULE.search(line) and JUDGMENT not in line
+    ]
+
+
 CHECKS = [
     ("ruff-lint", "Ruff finds no lint error", "lint", lambda: ruff(["check"])),
     (
@@ -148,6 +231,15 @@ CHECKS = [
         lambda: ruff(["format", "--check"], rule_codes=False),
     ),
     ("ast-grep", "No file breaks a check of checks/", "lint", ast_grep),
+    (
+        "setup-template",
+        f"The project was made from {TEMPLATE} and names a fixed template version",
+        "lint",
+        setup_template,
+    ),
+    ("setup-commands", "The Makefile has the check, fix and verify commands", "lint", setup_commands),
+    ("setup-workflows", "CI calls the shared check and security workflows", "lint", setup_workflows),
+    ("setup-agents-md", "AGENTS.md routes and states no written rule", "lint", setup_agents_md),
 ]
 # ast-grep first, so that the formatters tidy the lines its fixes leave.
 FIXES = [

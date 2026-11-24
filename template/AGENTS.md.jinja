@@ -12,3 +12,6 @@
 - `ruff.toml`{% if typescript %}, `biome.json`{% endif %}: lint and format configuration.
 - `.github/workflows/ci.yml`: CI, which calls the shared workflows of `Hugo-SEQUIER/ci-workflows`.
 - `.copier-answers.yml`: the template version and answers, for `uvx copier update`.
+
+## Rules
+- A rule is a check in `checks/project/` or `scripts/check.py`, not a line here: the `setup-agents-md` check fails on a written rule. A line that needs judgment ends with `<!-- judgment: why -->`.
