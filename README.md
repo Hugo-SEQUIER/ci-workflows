@@ -72,6 +72,19 @@ uvx copier copy gh:Hugo-SEQUIER/ci-workflows <folder>   # asks the name, the run
 uvx copier update                                       # in the project: the newest template version
 ```
 
+`make check` also runs four setup checks, which Cladeo's setup path asks for before the setup
+task of a project can enter review (docs/factory/CHECKS.md in Hugo-SEQUIER/systems):
+
+| Check | Passes when |
+|---|---|
+| `setup-template` | `.copier-answers.yml` names this template (`_src_path`) at a fixed tag (`_commit`, such as `v1.2.0`) |
+| `setup-commands` | The `Makefile` has the `check`, `fix` and `verify` targets |
+| `setup-workflows` | `.github/workflows/ci.yml` calls the shared `check.yml` and `security.yml` |
+| `setup-agents-md` | No line of `AGENTS.md` says "do not", "never", "always" or "must", unless it ends with `<!-- judgment: why -->` |
+
+A project copied from a local folder or an untagged commit fails `setup-template` until
+`uvx copier update` from `gh:Hugo-SEQUIER/ci-workflows` records a fixed tag.
+
 `copier update` merges the template's changes into the project's own edits; a line both changed
 shows as a git conflict (`<<<<<<< before updating`), and `make check` fails until it is resolved.
 The version a project has is `_commit` in its `.copier-answers.yml`.
