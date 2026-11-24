@@ -59,6 +59,30 @@ project. When `report` is set, the file is kept as the `check-report` artifact o
 when the command fails. A service the project needs, such as Postgres, stays in a job of the
 project's own workflow.
 
+## Merge report
+
+```yaml
+jobs:
+  merge-report:
+    if: github.event_name == 'push'
+    uses: Hugo-SEQUIER/ci-workflows/.github/workflows/merge-report.yml@v1
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      runs-on: '["self-hosted","<repo label>"]'
+      cladeo-url: ${{ vars.CLADEO_URL }}
+    secrets:
+      CLADEO_KEY: ${{ secrets.CLADEO_KEY }}
+```
+
+On a push to the default branch, asks GitHub which pull request was merged as the pushed commit
+(squash, merge or rebase) and sends `{"repository", "pull_request_number", "merged_commit"}` to
+Cladeo's `POST /v1/merge-reports`, so the task of that pull request moves to done. A push that
+merged no pull request sends nothing. Needs the repository variable `CLADEO_URL` and the secret
+`CLADEO_KEY` (a Cladeo agent key); without them the job fails and names what is missing. The key
+is never printed. The caller job grants `pull-requests: read`, which the lookup needs.
+
 ## Project template
 
 `copier.yml` and `template/` make a project ready for the factory: the `make check`, `make fix` and
