@@ -83,12 +83,42 @@ merged no pull request sends nothing. Needs the repository variable `CLADEO_URL`
 `CLADEO_KEY` (a Cladeo agent key); without them the job fails and names what is missing. The key
 is never printed. The caller job grants `pull-requests: read`, which the lookup needs.
 
+## Deployment report
+
+```yaml
+jobs:
+  deployment-report-stg:
+    needs: deploy-stg
+    if: always() && needs.deploy-stg.result != 'skipped'
+    uses: Hugo-SEQUIER/ci-workflows/.github/workflows/deployment-report.yml@v1
+    with:
+      runs-on: '["self-hosted","<repo label>"]'
+      cladeo-url: ${{ vars.CLADEO_URL }}
+      project: <Cladeo project key>
+      environment: stg
+      deploy-result: ${{ needs.deploy-stg.result }}
+      url: https://stg.example.com
+    secrets:
+      CLADEO_KEY: ${{ secrets.CLADEO_KEY }}
+```
+
+Runs after the project's own deploy job, whether it passed or failed, and sends Cladeo's
+`POST /v1/deployment-reports`: the project, the environment, the deployed commit, `succeeded` when
+the deploy job's result is `success` and `failed` otherwise, and the URL. `commits` lists the
+commits between the last successful deployment of that environment, read from Cladeo's
+`GET /v1/deployments/last-success`, and the deployed commit (`git rev-list`, at most 1,000, on a
+clone with the whole history). The first deployment of an environment, or a last commit this
+history lacks, sends every commit up to the deployed one (at most 1,000), because that deployment
+shipped them all. Cladeo links the
+report to each task whose merge commit it contains. One call per environment. Pull requests send
+nothing, so a fork cannot use the key; the key is never printed.
+
 ## Project template
 
 `copier.yml` and `template/` make a project ready for the factory: the `make check`, `make fix` and
 `make verify` commands (`scripts/check.py` holds the checks, their fixes and the tool versions),
 the Ruff configuration, Biome for TypeScript, ast-grep checks in `checks/shared/` (from the
-template) and `checks/project/` (the project's own), the CI caller of the three workflows above,
+template) and `checks/project/` (the project's own), the CI caller of the check, security and stale-references workflows (with the deployment report as a commented example),
 and an `AGENTS.md` that routes. Python and TypeScript; uv is needed, and Bun for TypeScript.
 
 ```bash

@@ -41,3 +41,21 @@ jobs:
     uses: Hugo-SEQUIER/ci-workflows/.github/workflows/stale-refs.yml@v1
     with:
       runs-on: '["self-hosted","{{ runner_label }}"]'
+
+  # A project that deploys adds its deploy job here, then one report per environment, so Cladeo
+  # shows where each task is deployed (Hugo-SEQUIER/ci-workflows, README "Deployment report"):
+  #
+  # deployment-report-prd:
+  #   needs: deploy-prd
+  #   if: always() && needs.deploy-prd.result != 'skipped'
+  #   uses: Hugo-SEQUIER/ci-workflows/.github/workflows/deployment-report.yml@v1
+  #   with:
+  #     runs-on: '["self-hosted","{{ runner_label }}"]'
+{%- raw %}
+  #     cladeo-url: ${{ vars.CLADEO_URL }}
+  #     project: <Cladeo project key>
+  #     environment: prd
+  #     deploy-result: ${{ needs.deploy-prd.result }}
+  #   secrets:
+  #     CLADEO_KEY: ${{ secrets.CLADEO_KEY }}
+{%- endraw %}
