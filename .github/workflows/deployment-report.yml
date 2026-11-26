@@ -1,0 +1,96 @@
+# Deployment report: after the project's own deploy job, tell Cladeo what it deployed, where, and
+# whether it worked, so each task shows the environments its merge reached. It does not deploy.
+# Called from each repository's own workflow, once per environment:
+#
+#   deployment-report-stg:
+#     needs: deploy-stg
+#     if: always() && needs.deploy-stg.result != 'skipped'
+#     uses: Hugo-SEQUIER/ci-workflows/.github/workflows/deployment-report.yml@v1
+#     with:
+#       runs-on: '["self-hosted","<repo label>"]'
+#       cladeo-url: ${{ vars.CLADEO_URL }}
+#       project: <Cladeo project key>
+#       environment: stg
+#       deploy-result: ${{ needs.deploy-stg.result }}
+#       url: https://stg.example.com
+#     secrets:
+#       CLADEO_KEY: ${{ secrets.CLADEO_KEY }}
+#
+# The commits sent are those between the last successful deployment of the environment, read
+# from Cladeo, and the deployed commit. The key is never printed. Pull requests send nothing.
+# The contract is in Hugo-SEQUIER/systems, docs/AGENT_INTERFACE.md#deployment-report.
+name: deployment-report
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: JSON array of runner labels, for example '["self-hosted","gta6"]'
+        type: string
+        required: true
+      cladeo-url:
+        description: Address of the Cladeo install, for example https://app.cladeo.dev
+        type: string
+        required: true
+      project:
+        description: Key of the Cladeo project the repository belongs to
+        type: string
+        required: true
+      environment:
+        description: Lowercase name of the environment, for example stg or prd
+        type: string
+        required: true
+      deploy-result:
+        description: The result of the deploy job, `needs.<job>.result`; success is reported as succeeded, anything else as failed
+        type: string
+        required: true
+      url:
+        description: Address of the deployed app, shown on the task page
+        type: string
+        default: ""
+      commit:
+        description: The deployed commit; defaults to the commit of the run
+        type: string
+        default: ""
+      ci-ref:
+        description: Ref of Hugo-SEQUIER/ci-workflows whose scripts to use; keep it equal to the ref in `uses:`
+        type: string
+        default: v1
+    secrets:
+      CLADEO_KEY:
+        description: A Cladeo agent key of the account that holds the project
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deployment-report:
+    name: deployment report
+    if: github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    steps:
+      # The whole history, so the commits since the last deployment can be listed.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: project
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: Hugo-SEQUIER/ci-workflows
+          ref: ${{ inputs.ci-ref }}
+          path: .ci-workflows
+          persist-credentials: false
+      - name: Report the deployment to Cladeo
+        working-directory: project
+        env:
+          CLADEO_URL: ${{ inputs.cladeo-url }}
+          CLADEO_KEY: ${{ secrets.CLADEO_KEY }}
+          PROJECT: ${{ inputs.project }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          DEPLOY_RESULT: ${{ inputs.deploy-result }}
+          DEPLOY_URL: ${{ inputs.url }}
+          DEPLOYED_COMMIT: ${{ inputs.commit || github.sha }}
+        run: python3 ../.ci-workflows/scripts/deployment_report.py
