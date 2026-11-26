@@ -45,15 +45,14 @@ def new_commits(last, deployed):
     The commits after `last` up to `deployed`, newest first. With no `last`, or one this history
     lacks, every commit up to `deployed`: the first deployment of an environment ships them all.
     """
-    listed = None
     if last is not None:
         listed = subprocess.run(["git", "rev-list", f"--max-count={MAX_COMMITS}", f"{last}..{deployed}"],
                                 capture_output=True, text=True)
-        if listed.returncode != 0:
-            print(f"{last}, the last successful deployment, is not in this history.")
-    if listed is None or listed.returncode != 0:
-        listed = subprocess.run(["git", "rev-list", f"--max-count={MAX_COMMITS}", deployed],
-                                capture_output=True, text=True, check=True)
+        if listed.returncode == 0:
+            return listed.stdout.split()
+        print(f"{last}, the last successful deployment, is not in this history.")
+    listed = subprocess.run(["git", "rev-list", f"--max-count={MAX_COMMITS}", deployed],
+                            capture_output=True, text=True, check=True)
     return listed.stdout.split()
 
 
