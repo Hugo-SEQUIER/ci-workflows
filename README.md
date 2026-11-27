@@ -68,26 +68,38 @@ jobs:
     with:
       runs-on: '["self-hosted","<repo label>"]'
       command: make check
-      colab: true        # colab-gpu: L4 (default), T4, A100 or CPU
+      colab: true        # colab-gpu: L4 (default), T4 or CPU; colab-min-minutes: 3 (default)
 ```
 
-With `colab: true` the check command runs on a fresh Google Colab VM instead of the runner: an
-L4 machine has 12 cores and 52 GB, against the 3 cores a runner gets on the host, and is billed
-about 2.3 compute units an hour of VM time (T4 and CPU have 2 cores). The VM clones the commit
-with the job's `GITHUB_TOKEN`, installs the toolchains the job names (uv, Node, Bun), runs the
-command and sends back its log, exit code and `report`. The VM is stopped after every job.
+With `colab: true` a slow check runs on a fresh Google Colab VM instead of the runner: an L4
+machine has 12 cores and 52 GB, against the 3 cores a runner gets on the host, and is billed
+about 2.3 compute units an hour of VM time (T4 and CPU have 2 cores). The VM clones the commit the
+runner would test (on a pull request, its merge with the base) with the job's `GITHUB_TOKEN`,
+installs the toolchains the job names (uv, Node, Bun), runs the command and sends back its log,
+exit code and `report`. The VM is stopped after every job.
 
-The check runs on the runner as before, with a notice in the run, whenever Colab cannot take it:
-the runner has no Colab access (GitHub-hosted runners, so fork pull requests too), fewer than 40
-compute units are left, the 4 VMs at once are busy for 2 minutes, or the VM fails to start, set up
-or answer. A failing check never falls back: it fails like on the runner. The VM has no Docker
-and no project services, so a job that needs Postgres keeps its own job.
+Colab only takes checks that are worth it. Each run on the runner records how long the check
+took, and Colab takes it once the median of its runner times over the last 30 days is at least
+`colab-min-minutes` (3 by default; 0 sends it to Colab every time). A new check therefore runs on
+the runner 3 times first. A VM costs about 40 seconds of start, setup and stop, so a check of a
+minute or less is faster on the runner.
 
-The host side lives in `colab/`: `colab-ci-run` (the broker), `vm-job.sh` (runs on the VM) and
-`install.sh`. The Colab login belongs to the `colabci` user; runner users (group
-`colab-ci-users`) may only start `colab-ci-run` as `colabci` through sudo, with the job on stdin,
-so a runner never reads the login. `colab-ci-reaper.timer` stops any VM a crashed job left behind.
-Install or update on the host, then log in once:
+The check runs on the runner as before, with a notice in the run that says why, whenever Colab
+does not take it: a light check, no Colab access on the runner (GitHub-hosted runners, so fork
+pull requests too), no L4 free within 30 seconds (then Colab is skipped for 10 minutes), fewer
+than 40 compute units left, 4 VMs already busy, the repository's 240 VM-minutes of the day used,
+a setting the VM does not handle (such as `node-version: lts/*`), or a VM that fails to start,
+set up or answer. A failing check never falls back: it fails like on the runner. A job with
+`colab: true` gets 40 minutes instead of 20, room for a late fallback. The VM has no Docker and
+no project services, so a job that needs Postgres keeps its own job.
+
+The host side lives in `colab/`: `colab-ci-run` (the broker), `colab_vm.py` (starts and releases
+a VM by a notebook hash the broker chose, so a VM placed after a timeout or a cancel is still
+released), `vm-job.sh` (runs on the VM) and `install.sh`. The Colab login belongs to the
+`colabci` user; runner users (group `colab-ci-users`) may only start `colab-ci-run` as `colabci`
+through sudo, with the job on stdin, so a runner never reads the login, and each may only send
+jobs for its own repository (`/etc/colab-ci/runners.json`). `colab-ci-reaper.timer` releases any
+VM a dead job left behind. Install or update on the host, then log in once:
 
 ```bash
 sudo colab/install.sh
@@ -95,8 +107,8 @@ sudo -u colabci env HOME=/var/lib/colab-ci PYTHON_KEYRING_BACKEND=keyrings.alt.f
   OAUTHLIB_RELAX_TOKEN_SCOPE=1 /opt/colab-ci/venv/bin/colab whoami   # prints a URL, paste the code
 ```
 
-A runner user joins `colab-ci-users` at install time, and its runner sees the group after its
-next restart.
+A new runner user joins `colab-ci-users` and `runners.json` when `install.sh` runs again; its
+runner sees the group after its next restart. Until then its checks run on the runner.
 
 ## Merge report
 
