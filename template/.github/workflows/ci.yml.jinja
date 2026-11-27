@@ -31,6 +31,9 @@ jobs:
 {%- endif %}
       command: make check
       report: check-report.json
+{%- if colab %}
+      colab: true
+{%- endif %}
 
   security:
     uses: Hugo-SEQUIER/ci-workflows/.github/workflows/security.yml@v1

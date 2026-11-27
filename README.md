@@ -59,6 +59,45 @@ project. When `report` is set, the file is kept as the `check-report` artifact o
 when the command fails. A service the project needs, such as Postgres, stays in a job of the
 project's own workflow.
 
+## Checks on Colab
+
+```yaml
+jobs:
+  check:
+    uses: Hugo-SEQUIER/ci-workflows/.github/workflows/check.yml@v1
+    with:
+      runs-on: '["self-hosted","<repo label>"]'
+      command: make check
+      colab: true        # colab-gpu: L4 (default), T4, A100 or CPU
+```
+
+With `colab: true` the check command runs on a fresh Google Colab VM instead of the runner: an
+L4 machine has 12 cores and 52 GB, against the 3 cores a runner gets on the host, and is billed
+about 2.3 compute units an hour of VM time (T4 and CPU have 2 cores). The VM clones the commit
+with the job's `GITHUB_TOKEN`, installs the toolchains the job names (uv, Node, Bun), runs the
+command and sends back its log, exit code and `report`. The VM is stopped after every job.
+
+The check runs on the runner as before, with a notice in the run, whenever Colab cannot take it:
+the runner has no Colab access (GitHub-hosted runners, so fork pull requests too), fewer than 40
+compute units are left, the 4 VMs at once are busy for 2 minutes, or the VM fails to start, set up
+or answer. A failing check never falls back: it fails like on the runner. The VM has no Docker
+and no project services, so a job that needs Postgres keeps its own job.
+
+The host side lives in `colab/`: `colab-ci-run` (the broker), `vm-job.sh` (runs on the VM) and
+`install.sh`. The Colab login belongs to the `colabci` user; runner users (group
+`colab-ci-users`) may only start `colab-ci-run` as `colabci` through sudo, with the job on stdin,
+so a runner never reads the login. `colab-ci-reaper.timer` stops any VM a crashed job left behind.
+Install or update on the host, then log in once:
+
+```bash
+sudo colab/install.sh
+sudo -u colabci env HOME=/var/lib/colab-ci PYTHON_KEYRING_BACKEND=keyrings.alt.file.PlaintextKeyring \
+  OAUTHLIB_RELAX_TOKEN_SCOPE=1 /opt/colab-ci/venv/bin/colab whoami   # prints a URL, paste the code
+```
+
+A runner user joins `colab-ci-users` at install time, and its runner sees the group after its
+next restart.
+
 ## Merge report
 
 ```yaml

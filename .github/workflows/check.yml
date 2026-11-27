@@ -44,6 +44,14 @@ on:
         description: Report file the command writes, relative to the repository root; empty keeps none
         type: string
         default: ""
+      colab:
+        description: Run the command on a Colab VM when the runner offers one (README "Checks on Colab"); falls back to the runner
+        type: boolean
+        default: false
+      colab-gpu:
+        description: Colab machine, L4 (12 cores, 52 GB, the default), T4 (2 cores), A100 or CPU (2 cores)
+        type: string
+        default: L4
 
 permissions:
   contents: read
@@ -54,20 +62,67 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - if: inputs.uv-version != ''
+      # A fork's pull request never reaches Colab: the VM runs on Hugo's Google account. Exit code
+      # 75 means Colab could not take the job (no credits, no free VM, a setup or connection
+      # failure), and the steps below run it here instead.
+      - id: colab
+        if: inputs.colab && !github.event.pull_request.head.repo.fork
+        name: Check command on Colab
+        env:
+          COMMAND: ${{ inputs.command }}
+          WORKDIR: ${{ inputs.working-directory }}
+          REPORT: ${{ inputs.report }}
+          UV_VERSION: ${{ inputs.uv-version }}
+          NODE_VERSION: ${{ inputs.node-version }}
+          BUN_VERSION: ${{ inputs.bun-version }}
+          GPU: ${{ inputs.colab-gpu }}
+          TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ ! -x /usr/local/bin/colab-ci-run ] || ! sudo -n -l -u colabci /usr/local/bin/colab-ci-run "" >/dev/null 2>&1; then
+            echo "This runner has no Colab access; the check runs here."
+            echo "ran=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          spec="$RUNNER_TEMP/colab-job.json"
+          jq -n --arg repository "$GITHUB_REPOSITORY" --arg sha "$SHA" --arg token "$TOKEN" \
+            --arg command "$COMMAND" --arg working_directory "$WORKDIR" --arg report "$REPORT" \
+            --arg uv_version "$UV_VERSION" --arg node_version "$NODE_VERSION" \
+            --arg bun_version "$BUN_VERSION" --arg gpu "$GPU" \
+            --arg run_label "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            '$ARGS.named + {timeout_minutes: 17}' > "$spec"
+          set +e
+          sudo -n -u colabci /usr/local/bin/colab-ci-run < "$spec" > "$RUNNER_TEMP/colab-report"
+          code=$?
+          set -e
+          rm -f "$spec"
+          if [ "$code" -eq 75 ]; then
+            echo "::notice title=Colab::Colab could not take this check; it runs on the runner."
+            echo "ran=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ran=true" >> "$GITHUB_OUTPUT"
+          if [ -n "$REPORT" ] && [ -s "$RUNNER_TEMP/colab-report" ]; then
+            mkdir -p "$(dirname "$GITHUB_WORKSPACE/$REPORT")"
+            cp "$RUNNER_TEMP/colab-report" "$GITHUB_WORKSPACE/$REPORT"
+          fi
+          exit "$code"
+      - if: steps.colab.outputs.ran != 'true'
+        uses: actions/checkout@v4
+      - if: steps.colab.outputs.ran != 'true' && inputs.uv-version != ''
         uses: astral-sh/setup-uv@v6
         with:
           version: ${{ inputs.uv-version }}
-      - if: inputs.node-version != ''
+      - if: steps.colab.outputs.ran != 'true' && inputs.node-version != ''
         uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-      - if: inputs.bun-version != ''
+      - if: steps.colab.outputs.ran != 'true' && inputs.bun-version != ''
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ inputs.bun-version }}
       - name: Check command
+        if: steps.colab.outputs.ran != 'true'
         working-directory: ${{ inputs.working-directory }}
         env:
           COMMAND: ${{ inputs.command }}
