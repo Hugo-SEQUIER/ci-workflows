@@ -91,7 +91,8 @@ than 40 compute units left, 4 VMs already busy, the repository's 240 VM-minutes 
 a setting the VM does not handle (such as `node-version: lts/*`), or a VM that fails to start,
 set up or answer. A failing check never falls back: it fails like on the runner. A check that runs
 past 17 minutes on Colab is stopped there and runs again on the runner, which may be faster than a
-2-core T4 or CPU machine. A job with `colab: true` gets 40 minutes instead of 20, room for that
+2-core T4 or CPU machine, and that check skips Colab for the next 24 hours, so a slow or hung check
+costs one double run. A job with `colab: true` gets 40 minutes instead of 20, room for that
 fallback. The VM has no Docker and no project services, so a job that needs Postgres keeps its own
 job.
 

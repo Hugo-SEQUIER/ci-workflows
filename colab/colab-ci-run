@@ -47,6 +47,7 @@ HISTORY = STATE / ".config/colab-cli/history"
 NEW_TIMEOUT = 30         # an L4 normally starts in 4 to 6 s; past this the runner takes the job
 LATE_VM_GRACE = 300      # a start we gave up on can still get a VM this long after
 COOLDOWN = 600           # after a VM fails to start, jobs go straight to the runner this long
+TIMEOUT_SKIP = 86400     # a check that ran past its Colab timeout skips Colab this long
 MAX_SLOTS = 4            # Colab VMs at once
 SLOT_WAIT = 60
 MIN_BALANCE = 40.0       # below this many compute units, every job runs on its runner
@@ -201,12 +202,14 @@ def with_stats(repository, change=None):
             data = {}
         data.setdefault("runner", {})
         data.setdefault("vm_seconds", {})
+        data.setdefault("timed_out", {})
         if change:
             change(data)
             cutoff = time.time() - RECORD_DAYS * 86400
             for key in list(data["runner"]):
                 data["runner"][key] = [r for r in data["runner"][key] if r[0] > cutoff][-20:]
             data["vm_seconds"] = dict(sorted(data["vm_seconds"].items())[-7:])
+            data["timed_out"] = {k: v for k, v in data["timed_out"].items() if v > time.time()}
             write_atomic(path, json.dumps(data))
         return data
 
@@ -229,9 +232,12 @@ def today():
 
 def worth_colab(job):
     """Raise Unavailable when the runner should keep this job."""
+    data = with_stats(job["repository"])
+    if data["timed_out"].get(job["job"], 0) > time.time():
+        raise Unavailable(f"this check ran past {job['timeout_minutes']} minutes on Colab in "
+                          f"the last {TIMEOUT_SKIP // 3600} hours")
     if job["min_minutes"] <= 0:
         return
-    data = with_stats(job["repository"])
     cutoff = time.time() - RECORD_DAYS * 86400
     times = [s for t, s in data["runner"].get(job["job"], []) if t > cutoff]
     if len(times) < MIN_RECORDS:
@@ -413,7 +419,11 @@ def run(job):
             check_parent()
             if time.time() > deadline:
                 # The job's 40 minutes leave room for the runner, which may be faster (T4 and
-                # CPU machines have 2 cores).
+                # CPU machines have 2 cores). The check skips Colab for a day, so a slow or
+                # hung check costs one double run, not 17 VM-minutes on every run.
+                until = int(time.time()) + TIMEOUT_SKIP
+                with_stats(job["repository"],
+                           lambda d, until=until: d["timed_out"].__setitem__(job["job"], until))
                 raise Unavailable(f"the check ran past {job['timeout_minutes']} minutes on Colab")
             try:
                 chunk = marked(py(config, name, POLL.format(pid=pid, offset=offset),
