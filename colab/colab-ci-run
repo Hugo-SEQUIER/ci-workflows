@@ -311,15 +311,17 @@ else:
 print("@@CI@@" + json.dumps(open("/content/ci/pid").read()))
 """
 
-# Status first, then the log: a status seen before a read that returns nothing new means the
-# whole log has been sent.
+# Alive first, then status, then the log. vm-job.sh writes its status before it exits, so a job
+# seen dead with no status after that died without one. The kernel that started the job never
+# reaps it, so an exited job lingers as a zombie (state Z), which counts as dead. A status seen
+# before a log read that returns nothing new means the whole log has been sent.
 POLL = """
 import base64, json, os
-status = open("/content/ci/status").read().strip() if os.path.exists("/content/ci/status") else ""
 try:
-    os.kill({pid}, 0); alive = True
-except ProcessLookupError:
+    alive = open("/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] != "Z"
+except (FileNotFoundError, IndexError):
     alive = False
+status = open("/content/ci/status").read().strip() if os.path.exists("/content/ci/status") else ""
 f = open("/content/ci/log", "rb"); f.seek({offset}); data = f.read(400000); f.close()
 print("@@CI@@" + json.dumps({{"n": len(data), "d": base64.b64encode(data).decode(),
                               "s": status, "alive": alive}}))
@@ -410,8 +412,9 @@ def run(job):
         while True:
             check_parent()
             if time.time() > deadline:
-                log(f"the command ran past {job['timeout_minutes']} minutes; stopping it")
-                return 124
+                # The job's 40 minutes leave room for the runner, which may be faster (T4 and
+                # CPU machines have 2 cores).
+                raise Unavailable(f"the check ran past {job['timeout_minutes']} minutes on Colab")
             try:
                 chunk = marked(py(config, name, POLL.format(pid=pid, offset=offset),
                                   attempts=1))

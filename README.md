@@ -89,9 +89,11 @@ does not take it: a light check, no Colab access on the runner (GitHub-hosted ru
 pull requests too), no L4 free within 30 seconds (then Colab is skipped for 10 minutes), fewer
 than 40 compute units left, 4 VMs already busy, the repository's 240 VM-minutes of the day used,
 a setting the VM does not handle (such as `node-version: lts/*`), or a VM that fails to start,
-set up or answer. A failing check never falls back: it fails like on the runner. A job with
-`colab: true` gets 40 minutes instead of 20, room for a late fallback. The VM has no Docker and
-no project services, so a job that needs Postgres keeps its own job.
+set up or answer. A failing check never falls back: it fails like on the runner. A check that runs
+past 17 minutes on Colab is stopped there and runs again on the runner, which may be faster than a
+2-core T4 or CPU machine. A job with `colab: true` gets 40 minutes instead of 20, room for that
+fallback. The VM has no Docker and no project services, so a job that needs Postgres keeps its own
+job.
 
 The host side lives in `colab/`: `colab-ci-run` (the broker), `colab_vm.py` (starts and releases
 a VM by a notebook hash the broker chose, so a VM placed after a timeout or a cancel is still
