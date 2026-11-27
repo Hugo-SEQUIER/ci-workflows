@@ -361,8 +361,8 @@ def balance(config):
 
 def run(job):
     worth_colab(job)
-    if read_int(STATE / "cooldown") > time.time():
-        raise Unavailable("a Colab VM failed to start in the last 10 minutes")
+    if read_int(STATE / f"cooldown-{job['gpu']}") > time.time():
+        raise Unavailable(f"no {job['gpu']} VM could start in the last 10 minutes")
     JOBS.mkdir(parents=True, exist_ok=True)
     (STATE / "tmp").mkdir(exist_ok=True)
     short = re.sub(r"[^a-z0-9]", "", job["repository"].split("/")[1].lower())[:16] or "repo"
@@ -392,7 +392,7 @@ def run(job):
             vm(home, "new", str(home / "hash"), str(config), name, job["gpu"],
                timeout=NEW_TIMEOUT)
         except Unavailable as error:
-            write_atomic(STATE / "cooldown", str(int(time.time()) + COOLDOWN))
+            write_atomic(STATE / f"cooldown-{job['gpu']}", str(int(time.time()) + COOLDOWN))
             raise Unavailable(f"no {job['gpu']} VM free right now ({error})") from None
         (home / "late").unlink(missing_ok=True)
         log(f"{job['gpu']} VM ready in {time.monotonic() - started:.0f}s "
