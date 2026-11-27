@@ -22,3 +22,8 @@ typescript_folder:
   default: web
   when: "{{ typescript }}"
   help: Folder of the TypeScript code and its tsconfig.json, relative to the root ("." for the root)
+
+colab:
+  type: bool
+  default: true
+  help: Run the check on a Colab L4 VM when the host offers it (falls back to the runner)?

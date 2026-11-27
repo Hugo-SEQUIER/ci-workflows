@@ -8,6 +8,7 @@
 #       command: just check
 #       uv-version: "0.12.21"        # each toolchain is installed only when its version is set
 #       report: check-report.sarif   # optional, kept as the run's `check-report` artifact
+#       colab: true                  # optional, README "Checks on Colab"
 #
 # The language knowledge stays in the project: this job knows the toolchains, not the checks.
 # A service the project needs, such as a database, stays in the project's own job.
@@ -44,6 +45,18 @@ on:
         description: Report file the command writes, relative to the repository root; empty keeps none
         type: string
         default: ""
+      colab:
+        description: Let Colab run the command when it is worth it (README "Checks on Colab"); the runner runs it otherwise
+        type: boolean
+        default: false
+      colab-gpu:
+        description: Colab machine, L4 (12 cores, 52 GB, the default), T4 (2 cores) or CPU (2 cores)
+        type: string
+        default: L4
+      colab-min-minutes:
+        description: Colab takes the check only when its median time on the runner is at least this many minutes; 0 sends it to Colab every time
+        type: number
+        default: 3
 
 permissions:
   contents: read
@@ -52,26 +65,104 @@ jobs:
   check:
     name: check
     runs-on: ${{ fromJSON(inputs.runs-on) }}
-    timeout-minutes: 20
+    # Room for a Colab attempt (17 minutes at most) and then the runner, when Colab fails late.
+    timeout-minutes: ${{ inputs.colab && 40 || 20 }}
     steps:
-      - uses: actions/checkout@v4
-      - if: inputs.uv-version != ''
+      # A fork's pull request never reaches Colab: the VM runs on Hugo's Google account. Exit code
+      # 75 means Colab should not or could not take the job (a light check, no free VM, no
+      # credits, a setup or connection failure), and the steps below run it here instead.
+      - id: colab
+        if: inputs.colab && !github.event.pull_request.head.repo.fork
+        name: Check command on Colab
+        env:
+          COMMAND: ${{ inputs.command }}
+          WORKDIR: ${{ inputs.working-directory }}
+          REPORT: ${{ inputs.report }}
+          UV_VERSION: ${{ inputs.uv-version }}
+          NODE_VERSION: ${{ inputs.node-version }}
+          BUN_VERSION: ${{ inputs.bun-version }}
+          GPU: ${{ inputs.colab-gpu }}
+          MIN_MINUTES: ${{ inputs.colab-min-minutes }}
+          TOKEN: ${{ github.token }}
+          # The commit the runner would test: on a pull request, its merge with the base.
+          SHA: ${{ github.sha }}
+        run: |
+          # One key per check of a repository, to compare its runner times.
+          KEY=$(printf '%s/%s/%s' "$GITHUB_WORKFLOW" "$WORKDIR" \
+            "$(printf %s "$COMMAND" | sha256sum | cut -c1-8)" | tr -c 'A-Za-z0-9._/-' '_')
+          export KEY
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          if [ ! -x /usr/local/bin/colab-ci-run ] || ! sudo -n -l -u colabci /usr/local/bin/colab-ci-run >/dev/null 2>&1; then
+            echo "This runner has no Colab access; the check runs here."
+            echo "ran=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          set +e
+          # Values come from the environment, never the command line, which other users can read.
+          jq -n '{repository: env.GITHUB_REPOSITORY, sha: env.SHA, token: env.TOKEN,
+                  command: env.COMMAND, working_directory: env.WORKDIR, report: env.REPORT,
+                  uv_version: env.UV_VERSION, node_version: env.NODE_VERSION,
+                  bun_version: env.BUN_VERSION, gpu: env.GPU, job: env.KEY,
+                  min_minutes: (env.MIN_MINUTES | tonumber), timeout_minutes: 17,
+                  run_label: "\(env.GITHUB_RUN_ID)-\(env.GITHUB_RUN_ATTEMPT)"}' \
+            | sudo -n -u colabci /usr/local/bin/colab-ci-run > "$RUNNER_TEMP/colab-report" \
+              2> >(tee "$RUNNER_TEMP/colab-log" >&2)
+          code=${PIPESTATUS[1]}
+          wait $! 2>/dev/null
+          set -e
+          if [ "$code" -eq 75 ]; then
+            reason=$(grep -h '^colab-ci: runs on the runner: ' "$RUNNER_TEMP/colab-log" | tail -1 \
+              | cut -c31- | tr -d '\r%' | cut -c1-200)
+            echo "::notice title=Colab::Runs on the runner: ${reason:-Colab could not take it}"
+            echo "ran=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ran=true" >> "$GITHUB_OUTPUT"
+          if [ -n "$REPORT" ]; then
+            # The workspace is not cleaned when Colab ran; never upload an older run's report.
+            rm -f "$GITHUB_WORKSPACE/$REPORT"
+            if [ -s "$RUNNER_TEMP/colab-report" ]; then
+              mkdir -p "$(dirname "$GITHUB_WORKSPACE/$REPORT")"
+              cp "$RUNNER_TEMP/colab-report" "$GITHUB_WORKSPACE/$REPORT"
+            fi
+          fi
+          exit "$code"
+      - if: steps.colab.outputs.ran != 'true'
+        uses: actions/checkout@v4
+      - if: steps.colab.outputs.ran != 'true' && inputs.uv-version != ''
         uses: astral-sh/setup-uv@v6
         with:
           version: ${{ inputs.uv-version }}
-      - if: inputs.node-version != ''
+      - if: steps.colab.outputs.ran != 'true' && inputs.node-version != ''
         uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-      - if: inputs.bun-version != ''
+      - if: steps.colab.outputs.ran != 'true' && inputs.bun-version != ''
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ inputs.bun-version }}
       - name: Check command
+        id: local
+        if: steps.colab.outputs.ran != 'true'
         working-directory: ${{ inputs.working-directory }}
         env:
           COMMAND: ${{ inputs.command }}
-        run: bash -euo pipefail -c "$COMMAND"
+        run: |
+          start=$(date +%s)
+          bash -euo pipefail -c "$COMMAND"
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+      # The runner's time decides whether Colab is worth it for this check next time.
+      - name: Record the check time
+        if: steps.local.outputs.seconds != '' && steps.colab.outputs.key != ''
+        continue-on-error: true
+        env:
+          KEY: ${{ steps.colab.outputs.key }}
+          TAKEN: ${{ steps.local.outputs.seconds }}
+        run: |
+          if sudo -n -l -u colabci /usr/local/bin/colab-ci-run >/dev/null 2>&1; then
+            jq -n '{record: {job: env.KEY, seconds: (env.TAKEN | tonumber)}}' \
+              | sudo -n -u colabci /usr/local/bin/colab-ci-run
+          fi
       # Kept on failure too: the report says which check failed.
       - if: always() && inputs.report != ''
         uses: actions/upload-artifact@v4
