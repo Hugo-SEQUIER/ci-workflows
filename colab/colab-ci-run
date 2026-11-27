@@ -138,14 +138,35 @@ def take_slot():
         time.sleep(5)
 
 
-def py(config, name, code, timeout=60):
-    """Run Python in the VM's kernel; return its stdout."""
-    r = subprocess.run([COLAB, "--config", str(config), "exec", "-s", name,
-                        "--timeout", str(timeout)], input=code, env=ENV, capture_output=True,
-                       text=True, timeout=timeout + 60)
-    if r.returncode != 0:
-        raise Unavailable(f"kernel call failed: {redact(r.stderr.strip())[-300:]}")
-    return r.stdout
+def py(config, name, code, timeout=45, attempts=3):
+    """Run Python in the VM's kernel and return its stdout.
+
+    The kernel connection drops now and then; a restart renews it, and the detached job keeps
+    running. So every cell sent here must be safe to run twice.
+    """
+    error = "no attempt"
+    for attempt in range(attempts):
+        if attempt:
+            restart_kernel(config, name)
+            time.sleep(3)
+        try:
+            r = subprocess.run([COLAB, "--config", str(config), "exec", "-s", name,
+                                "--timeout", str(timeout)], input=code, env=ENV,
+                               capture_output=True, text=True, timeout=timeout + 30)
+        except subprocess.TimeoutExpired:
+            error = f"no answer in {timeout + 30}s"
+            continue
+        if r.returncode == 0:
+            return r.stdout
+        error = redact(r.stderr.strip())[-300:]
+    raise Unavailable(f"kernel call failed after {attempts} tries: {error}")
+
+
+def marked(out):
+    line = next((x for x in out.splitlines() if x.startswith("@@CI@@")), None)
+    if line is None:
+        raise Unavailable("the kernel answered without the expected output")
+    return json.loads(line[6:])
 
 
 POLL = """
@@ -155,14 +176,34 @@ status = open("/content/ci/status").read().strip() if os.path.exists("/content/c
 print("@@CI@@" + json.dumps({{"n": len(data), "d": base64.b64encode(data).decode(), "s": status}}))
 """
 
+# Writes the job files and starts vm-job.sh once: a second run of this cell (after a dropped
+# connection) finds the marker and starts nothing.
 START = """
-import os, subprocess
-log = open("/content/ci/log", "wb")
-env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root",
-       "LANG": "C.UTF-8", "CI": "true", "TERM": "dumb"}
-subprocess.Popen(["bash", "/content/ci/vm-job.sh"], stdout=log, stderr=subprocess.STDOUT,
-                 stdin=subprocess.DEVNULL, env=env, start_new_session=True, cwd="/content/ci")
-print("started")
+import base64, json, os, subprocess
+os.makedirs("/content/ci", exist_ok=True)
+try:
+    os.close(os.open("/content/ci/started", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+except FileExistsError:
+    print("@@CI@@" + json.dumps("already started"))
+else:
+    for name, content in json.loads(base64.b64decode("{files}")).items():
+        fd = os.open("/content/ci/" + name, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+    env = {{"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+           "HOME": "/root", "LANG": "C.UTF-8", "CI": "true", "TERM": "dumb"}}
+    subprocess.Popen(["bash", "/content/ci/vm-job.sh"], stdout=open("/content/ci/log", "wb"),
+                     stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
+                     start_new_session=True, cwd="/content/ci")
+    print("@@CI@@" + json.dumps("started"))
+"""
+
+REPORT = """
+import base64, json, os
+path = os.path.realpath("/content/ci/repo/" + {path!r})
+ok = path.startswith("/content/ci/repo/") and os.path.isfile(path)
+data = open(path, "rb").read(5_000_000) if ok else b""
+print("@@CI@@" + json.dumps({{"ok": ok, "d": base64.b64encode(data).decode()}}))
 """
 
 
@@ -207,22 +248,13 @@ def run(job):
             raise
         log(f"{job['gpu']} VM ready in {time.monotonic() - started:.0f}s "
             f"({units:.1f} compute units left)")
-        py(config, name, "import os; os.makedirs('/content/ci', exist_ok=True)")
         env_lines = [f"{k.upper()}={shlex.quote(job[k])}" for k in (
             "repository", "sha", "working_directory", "uv_version", "node_version",
             "bun_version")]
         files = {"job.env": "\n".join(env_lines) + "\n", "command": job["command"],
-                 "token": job["token"]}
-        for fname, content in files.items():
-            local = home / fname
-            local.write_text(content)
-            local.chmod(0o600)
-            try:
-                colab(config, "upload", "-s", name, str(local), f"/content/ci/{fname}")
-            finally:
-                local.unlink()
-        colab(config, "upload", "-s", name, VM_SCRIPT, "/content/ci/vm-job.sh")
-        py(config, name, START)
+                 "token": job["token"], "vm-job.sh": Path(VM_SCRIPT).read_text()}
+        payload = base64.b64encode(json.dumps(files).encode()).decode()
+        marked(py(config, name, START.format(files=payload)))
 
         offset, failures, status = 0, 0, ""
         while True:
@@ -230,11 +262,9 @@ def run(job):
                 log(f"the command ran past {job['timeout_minutes']} minutes; stopping it")
                 return 124
             try:
-                out = py(config, name, POLL.format(offset=offset))
-                line = next(x for x in out.splitlines() if x.startswith("@@CI@@"))
-                chunk = json.loads(line[6:])
+                chunk = marked(py(config, name, POLL.format(offset=offset), attempts=1))
                 failures = 0
-            except (Unavailable, StopIteration, json.JSONDecodeError) as error:
+            except (Unavailable, json.JSONDecodeError) as error:
                 failures += 1
                 if failures >= 6:
                     raise Unavailable(f"lost the VM: {error}") from None
@@ -255,11 +285,9 @@ def run(job):
         if code == UNAVAILABLE:
             raise Unavailable("the VM could not set up the job")
         if job["report"]:
-            local = home / "report"
-            r = colab(config, "download", "-s", name, f"/content/ci/repo/{job['report']}",
-                      str(local), check=False)
-            if r.returncode == 0 and local.exists():
-                sys.stdout.buffer.write(local.read_bytes())
+            found = marked(py(config, name, REPORT.format(path=job["report"])))
+            if found["ok"]:
+                sys.stdout.buffer.write(base64.b64decode(found["d"]))
                 sys.stdout.flush()
             else:
                 log(f"no report at {job['report']}")
@@ -289,6 +317,8 @@ def stop(config, name, home):
         colab(config, "stop", "-s", name, timeout=90, check=False)
     except Unavailable as error:
         log(f"`colab stop` did not answer ({error}); releasing by notebook hash")
+    # The CLI keeps every cell it sent, the job token included, in a local history file.
+    (STATE / ".config/colab-cli/history" / f"{name}.jsonl").unlink(missing_ok=True)
     if not (home / "hash").exists():
         shutil.rmtree(home, ignore_errors=True)
         return True
@@ -349,6 +379,9 @@ def main():
         return UNAVAILABLE
     except KeyboardInterrupt:
         return 130
+    except Exception as error:  # noqa: BLE001 - a broker bug must not fail the project's check
+        log(f"broker error, the runner takes the job: {redact(repr(error))[-400:]}")
+        return UNAVAILABLE
 
 
 if __name__ == "__main__":
