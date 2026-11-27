@@ -1,61 +1,80 @@
 #!/usr/bin/python3
-"""Run one CI check command on a fresh Google Colab VM.
+"""Run one CI check command on a fresh Google Colab VM, when that is worth it.
 
-Called by check.yml through `sudo -n -u colabci /usr/local/bin/colab-ci-run` with a JSON job
-spec on stdin, so runner users never read the Colab login token (it belongs to `colabci`).
+Called by check.yml through `sudo -n -u colabci /usr/local/bin/colab-ci-run` with a JSON message
+on stdin, so runner users never read the Colab login token (it belongs to `colabci`).
 
-Input (stdin, JSON): repository, sha, token (the job's GITHUB_TOKEN, used once to clone on the
-VM), command, working_directory, report, uv_version, node_version, bun_version, gpu,
-timeout_minutes, run_label.
-Output: the command's log on stderr; the report file's bytes on stdout when `report` is set.
-Exit code: the command's exit code, or 75 when Colab could not run it (no credits, no free slot,
-no VM, setup or connection failure), so the caller runs the command on its own runner instead.
+Messages (stdin, JSON):
+- a job: repository, sha, token (the job's GITHUB_TOKEN, used once to clone on the VM), command,
+  working_directory, report, uv_version, node_version, bun_version, gpu, job, min_minutes,
+  timeout_minutes, run_label. Output: the command's log on stderr, the report's bytes on stdout.
+  Exit code: the command's exit code, or 75 when Colab should not or could not run it, so the
+  caller runs the command on its own runner instead.
+- {"record": {"job": ..., "seconds": ...}}: the time a check took on the runner. Colab takes a
+  job only once its runner median over the last 30 days is at least `min_minutes`.
 
-`colab-ci-run --reap` (run by colab-ci-reaper.timer) stops sessions whose deadline passed, in
-case a broker died before its own cleanup.
+Each runner user may only send jobs for its own repository (/etc/colab-ci/runners.json, written
+by install.sh). `colab-ci-run --reap` (colab-ci-reaper.timer) releases VMs a dead job left.
 """
 import base64
 import fcntl
 import json
+import os
 import re
 import secrets
 import shlex
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 COLAB = "/opt/colab-ci/venv/bin/colab"
 VENV_PYTHON = "/opt/colab-ci/venv/bin/python"
 COLAB_VM = "/usr/local/lib/colab-ci/colab_vm.py"
 VM_SCRIPT = "/usr/local/lib/colab-ci/vm-job.sh"
-NEW_TIMEOUT = 150        # Colab can be slow to place a VM; past this the runner takes the job
-LATE_VM_GRACE = 300      # a killed start can still get a VM this long after; the reaper checks
-COOLDOWN = 600           # after a VM fails to start, jobs go straight to the runner this long
+RUNNERS = Path("/etc/colab-ci/runners.json")
 STATE = Path("/var/lib/colab-ci")
 JOBS = STATE / "jobs"
 SLOTS = STATE / "slots"
-MAX_SLOTS = 4            # Colab VMs at once; a job that finds none free in SLOT_WAIT runs locally
-SLOT_WAIT = 120
-MIN_BALANCE = 40.0       # below this many compute units, every job runs locally
+STATS = STATE / "stats"
+HISTORY = STATE / ".config/colab-cli/history"
+
+NEW_TIMEOUT = 30         # an L4 normally starts in 4 to 6 s; past this the runner takes the job
+LATE_VM_GRACE = 300      # a start we gave up on can still get a VM this long after
+COOLDOWN = 600           # after a VM fails to start, jobs go straight to the runner this long
+MAX_SLOTS = 4            # Colab VMs at once
+SLOT_WAIT = 60
+MIN_BALANCE = 40.0       # below this many compute units, every job runs on its runner
+DAILY_VM_MINUTES = 240   # per repository and UTC day, about 9 compute units on an L4
+MIN_RECORDS = 3          # runner times needed before Colab takes a job
+RECORD_DAYS = 30
+MAX_TIMEOUT = 18
+GPUS = {"L4", "T4", "CPU"}
 UNAVAILABLE = 75
-OWNER = "Hugo-SEQUIER"
-GPUS = {"L4", "T4", "A100", "CPU"}
+CANCELLED = 130
 ENV = {
     "HOME": str(STATE),
     "PATH": "/usr/local/bin:/usr/bin:/bin",
     "PYTHON_KEYRING_BACKEND": "keyrings.alt.file.PlaintextKeyring",
     "OAUTHLIB_RELAX_TOKEN_SCOPE": "1",
+    "COLAB_CLI_ASSIGN_RETRIES": "0",
+    "TMPDIR": str(STATE / "tmp"),
     "LANG": "C.UTF-8",
 }
-URL = re.compile(r"https?://\S+")
+SECRET = re.compile(r"(?i)(wss?|https?)://\S+|[\w-]*token=[^&\s'\"]+")
 
 
 class Unavailable(Exception):
-    """Colab could not run the job; the caller falls back to its runner."""
+    """Colab should not or could not run the job; the caller runs it on its runner."""
+
+
+class Cancelled(Exception):
+    """sudo, and so the job that called us, went away."""
 
 
 def log(msg):
@@ -63,14 +82,35 @@ def log(msg):
 
 
 def redact(text):
-    # CLI errors can carry runtime proxy URLs with tokens in them.
-    return URL.sub("<url>", text)
+    # CLI errors can carry runtime proxy URLs and tokens.
+    return SECRET.sub("<redacted>", text)
+
+
+def write_atomic(path, text):
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def read_int(path, default=0):
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return default
+
+
+PARENT = os.getppid()
+
+
+def check_parent():
+    if os.getppid() != PARENT:
+        raise Cancelled()
 
 
 def colab(config, *args, timeout=120, check=True):
-    cmd = [COLAB, "--config", str(config), *args]
     try:
-        r = subprocess.run(cmd, env=ENV, capture_output=True, text=True, timeout=timeout,
+        r = subprocess.run([COLAB, "--config", str(config), *args], env=ENV,
+                           capture_output=True, text=True, timeout=timeout,
                            stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         raise Unavailable(f"`colab {args[0]}` timed out") from None
@@ -80,46 +120,218 @@ def colab(config, *args, timeout=120, check=True):
     return r
 
 
-def validate(spec):
+def vm(home, *args, timeout=60):
+    """Run colab_vm.py: start, or release, the VM of this job's notebook hash."""
+    try:
+        r = subprocess.run([VENV_PYTHON, COLAB_VM, *args], env=ENV, capture_output=True,
+                           text=True, timeout=timeout, stdin=subprocess.DEVNULL, cwd=home)
+    except subprocess.TimeoutExpired:
+        raise Unavailable(f"no VM within {timeout}s") from None
+    if r.returncode != 0:
+        tail = redact((r.stderr or r.stdout).strip())[-600:]
+        raise Unavailable(f"`colab_vm.py {args[0]}` failed ({r.returncode}): {tail}")
+    return r.stdout
+
+
+# ---- messages ----------------------------------------------------------------------------
+
+JOB_KEY = r"[A-Za-z0-9 ._/()-]{1,200}"
+
+
+def own_repository():
+    try:
+        return json.loads(RUNNERS.read_text()).get(os.environ.get("SUDO_USER", ""))
+    except (OSError, ValueError):
+        return None
+
+
+def validate(spec, repository):
+    """Return the job, or raise Unavailable: a job Colab cannot take still runs on the runner."""
     def text(key, pattern, required=True):
         value = spec.get(key, "")
         if not isinstance(value, str) or (required and not value) or (
                 value and not re.fullmatch(pattern, value)):
-            raise ValueError(f"bad {key}")
+            raise Unavailable(f"the job's {key} is not one Colab handles")
         return value
 
     path = r"(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._/-]{1,200}"
+    version = r"[0-9]{1,3}(\.[0-9]{1,4}){0,2}"
     job = {
-        "repository": text("repository", rf"{OWNER}/[A-Za-z0-9._-]{{1,100}}"),
+        "repository": text("repository", r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}"),
         "sha": text("sha", r"[0-9a-f]{40}"),
         "token": text("token", r"[A-Za-z0-9_.-]{20,400}"),
         "working_directory": text("working_directory", path, required=False) or ".",
         "report": text("report", path, required=False),
-        "uv_version": text("uv_version", r"[0-9][0-9.]{0,19}", required=False),
-        "node_version": text("node_version", r"[0-9][0-9.]{0,19}", required=False),
-        "bun_version": text("bun_version", r"[0-9][0-9.]{0,19}", required=False),
-        "gpu": text("gpu", r"[A-Z0-9]{1,8}", required=False) or "L4",
+        "uv_version": text("uv_version", version, required=False),
+        "node_version": text("node_version", version, required=False),
+        "bun_version": text("bun_version", version, required=False),
+        "gpu": (text("gpu", r"[A-Za-z0-9]{1,8}", required=False) or "L4").upper(),
+        "job": text("job", JOB_KEY),
         "run_label": text("run_label", r"[0-9]{1,20}-[0-9]{1,4}"),
     }
+    if job["repository"] != repository:
+        raise Unavailable(f"this runner may only send jobs for {repository}")
+    if job["gpu"] not in GPUS:
+        raise Unavailable(f"gpu must be one of {', '.join(sorted(GPUS))}")
     command = spec.get("command")
     if not isinstance(command, str) or not command.strip() or len(command) > 20000:
-        raise ValueError("bad command")
+        raise Unavailable("the command is empty or too long")
     job["command"] = command
-    if job["gpu"] not in GPUS:
-        raise ValueError("bad gpu")
-    minutes = spec.get("timeout_minutes", 18)
-    if not isinstance(minutes, int) or not 1 <= minutes <= 60:
-        raise ValueError("bad timeout_minutes")
-    job["timeout_minutes"] = minutes
+    minutes = spec.get("timeout_minutes", MAX_TIMEOUT)
+    job["timeout_minutes"] = min(max(int(minutes), 1), MAX_TIMEOUT)
+    job["min_minutes"] = max(float(spec.get("min_minutes", 3)), 0.0)
     return job
 
 
-def balance(config):
-    out = colab(config, "usage", timeout=60).stdout
-    m = re.search(r"Current balance:\s*([0-9.]+)", out)
-    if not m:
-        raise Unavailable("could not read the compute-unit balance")
-    return float(m.group(1))
+# ---- per-repository stats: runner times and Colab use -------------------------------------
+
+def stats_path(repository):
+    return STATS / (repository.replace("/", "__") + ".json")
+
+
+def with_stats(repository, change=None):
+    """Read, and optionally change, a repository's stats under a lock."""
+    STATS.mkdir(parents=True, exist_ok=True)
+    with open(STATS / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = stats_path(repository)
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = {}
+        data.setdefault("runner", {})
+        data.setdefault("vm_seconds", {})
+        if change:
+            change(data)
+            cutoff = time.time() - RECORD_DAYS * 86400
+            for key in list(data["runner"]):
+                data["runner"][key] = [r for r in data["runner"][key] if r[0] > cutoff][-20:]
+            data["vm_seconds"] = dict(sorted(data["vm_seconds"].items())[-7:])
+            write_atomic(path, json.dumps(data))
+        return data
+
+
+def record(repository, spec):
+    entry = spec.get("record") or {}
+    key, seconds = entry.get("job"), entry.get("seconds")
+    if not (isinstance(key, str) and re.fullmatch(JOB_KEY, key)
+            and isinstance(seconds, (int, float)) and 0 <= seconds < 86400):
+        log("rejected the record")
+        return 2
+    with_stats(repository, lambda d: d["runner"].setdefault(key, []).append(
+        [int(time.time()), int(seconds)]))
+    return 0
+
+
+def today():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def worth_colab(job):
+    """Raise Unavailable when the runner should keep this job."""
+    if job["min_minutes"] <= 0:
+        return
+    data = with_stats(job["repository"])
+    cutoff = time.time() - RECORD_DAYS * 86400
+    times = [s for t, s in data["runner"].get(job["job"], []) if t > cutoff]
+    if len(times) < MIN_RECORDS:
+        raise Unavailable(f"measuring this check on the runner first ({len(times)} of "
+                          f"{MIN_RECORDS} runs recorded)")
+    median = statistics.median(times) / 60
+    if median < job["min_minutes"]:
+        raise Unavailable(f"light check: {median:.1f} min on the runner, under the "
+                          f"{job['min_minutes']:g} min Colab is used for")
+    used = data["vm_seconds"].get(today(), 0) / 60
+    if used >= DAILY_VM_MINUTES:
+        raise Unavailable(f"this repository used its {DAILY_VM_MINUTES} Colab minutes today")
+
+
+# ---- the VM job ----------------------------------------------------------------------------
+
+def py(config, name, code, timeout=45, attempts=3):
+    """Run Python in the VM's kernel and return its stdout.
+
+    The kernel connection drops now and then; a restart renews it, and the detached job keeps
+    running. So every cell sent here must be safe to run twice.
+    """
+    error = "no attempt"
+    for attempt in range(attempts):
+        check_parent()
+        if attempt:
+            restart_kernel(config, name)
+            time.sleep(3)
+        try:
+            r = subprocess.run([COLAB, "--config", str(config), "exec", "-s", name,
+                                "--timeout", str(timeout)], input=code, env=ENV,
+                               capture_output=True, text=True, timeout=timeout + 30)
+        except subprocess.TimeoutExpired:
+            error = f"no answer in {timeout + 30}s"
+            continue
+        if r.returncode == 0:
+            return r.stdout[-2_000_000:]
+        error = redact(r.stderr.strip())[-300:]
+    raise Unavailable(f"kernel call failed after {attempts} tries: {error}")
+
+
+def marked(out):
+    line = next((x for x in out.splitlines() if x.startswith("@@CI@@")), None)
+    if line is None:
+        raise Unavailable("the kernel answered without the expected output")
+    return json.loads(line[6:])
+
+
+def restart_kernel(config, name):
+    # The detached job survives a kernel restart; only the connection is renewed.
+    try:
+        colab(config, "restart-kernel", "-s", name, timeout=90, check=False)
+    except Unavailable:
+        pass
+
+
+# Writes the job files and starts vm-job.sh once: a second run of this cell (after a dropped
+# connection) finds the marker and starts nothing.
+START = """
+import base64, json, os, subprocess
+os.makedirs("/content/ci", exist_ok=True)
+try:
+    os.close(os.open("/content/ci/started", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+except FileExistsError:
+    pass
+else:
+    for name, content in json.loads(base64.b64decode("{files}")).items():
+        fd = os.open("/content/ci/" + name, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+    env = {{"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+           "HOME": "/root", "LANG": "C.UTF-8", "CI": "true", "TERM": "dumb"}}
+    p = subprocess.Popen(["bash", "/content/ci/vm-job.sh"], stdout=open("/content/ci/log", "wb"),
+                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
+                         start_new_session=True, cwd="/content/ci")
+    open("/content/ci/pid", "w").write(str(p.pid))
+print("@@CI@@" + json.dumps(open("/content/ci/pid").read()))
+"""
+
+# Status first, then the log: a status seen before a read that returns nothing new means the
+# whole log has been sent.
+POLL = """
+import base64, json, os
+status = open("/content/ci/status").read().strip() if os.path.exists("/content/ci/status") else ""
+try:
+    os.kill({pid}, 0); alive = True
+except ProcessLookupError:
+    alive = False
+f = open("/content/ci/log", "rb"); f.seek({offset}); data = f.read(400000); f.close()
+print("@@CI@@" + json.dumps({{"n": len(data), "d": base64.b64encode(data).decode(),
+                              "s": status, "alive": alive}}))
+"""
+
+REPORT = """
+import base64, json, os
+path = os.path.realpath("/content/ci/repo/" + {path!r})
+ok = path.startswith("/content/ci/repo/") and os.path.isfile(path)
+data = open(path, "rb").read(5_000_000) if ok else b""
+print("@@CI@@" + json.dumps({{"ok": ok, "d": base64.b64encode(data).decode()}}))
+"""
 
 
 def take_slot():
@@ -134,139 +346,79 @@ def take_slot():
             except BlockingIOError:
                 handle.close()
         if time.monotonic() > deadline:
-            raise Unavailable(f"all {MAX_SLOTS} Colab slots stayed busy for {SLOT_WAIT}s")
+            raise Unavailable(f"all {MAX_SLOTS} Colab VMs stayed busy for {SLOT_WAIT}s")
+        check_parent()
         time.sleep(5)
 
 
-def py(config, name, code, timeout=45, attempts=3):
-    """Run Python in the VM's kernel and return its stdout.
-
-    The kernel connection drops now and then; a restart renews it, and the detached job keeps
-    running. So every cell sent here must be safe to run twice.
-    """
-    error = "no attempt"
-    for attempt in range(attempts):
-        if attempt:
-            restart_kernel(config, name)
-            time.sleep(3)
-        try:
-            r = subprocess.run([COLAB, "--config", str(config), "exec", "-s", name,
-                                "--timeout", str(timeout)], input=code, env=ENV,
-                               capture_output=True, text=True, timeout=timeout + 30)
-        except subprocess.TimeoutExpired:
-            error = f"no answer in {timeout + 30}s"
-            continue
-        if r.returncode == 0:
-            return r.stdout
-        error = redact(r.stderr.strip())[-300:]
-    raise Unavailable(f"kernel call failed after {attempts} tries: {error}")
-
-
-def marked(out):
-    line = next((x for x in out.splitlines() if x.startswith("@@CI@@")), None)
-    if line is None:
-        raise Unavailable("the kernel answered without the expected output")
-    return json.loads(line[6:])
-
-
-POLL = """
-import base64, json, os
-f = open("/content/ci/log", "rb"); f.seek({offset}); data = f.read(400000); f.close()
-status = open("/content/ci/status").read().strip() if os.path.exists("/content/ci/status") else ""
-print("@@CI@@" + json.dumps({{"n": len(data), "d": base64.b64encode(data).decode(), "s": status}}))
-"""
-
-# Writes the job files and starts vm-job.sh once: a second run of this cell (after a dropped
-# connection) finds the marker and starts nothing.
-START = """
-import base64, json, os, subprocess
-os.makedirs("/content/ci", exist_ok=True)
-try:
-    os.close(os.open("/content/ci/started", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-except FileExistsError:
-    print("@@CI@@" + json.dumps("already started"))
-else:
-    for name, content in json.loads(base64.b64decode("{files}")).items():
-        fd = os.open("/content/ci/" + name, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(content)
-    env = {{"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-           "HOME": "/root", "LANG": "C.UTF-8", "CI": "true", "TERM": "dumb"}}
-    subprocess.Popen(["bash", "/content/ci/vm-job.sh"], stdout=open("/content/ci/log", "wb"),
-                     stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
-                     start_new_session=True, cwd="/content/ci")
-    print("@@CI@@" + json.dumps("started"))
-"""
-
-REPORT = """
-import base64, json, os
-path = os.path.realpath("/content/ci/repo/" + {path!r})
-ok = path.startswith("/content/ci/repo/") and os.path.isfile(path)
-data = open(path, "rb").read(5_000_000) if ok else b""
-print("@@CI@@" + json.dumps({{"ok": ok, "d": base64.b64encode(data).decode()}}))
-"""
-
-
-def restart_kernel(config, name):
-    # The detached job survives a kernel restart; only the connection is renewed.
-    colab(config, "restart-kernel", "-s", name, timeout=90, check=False)
+def balance(config):
+    out = colab(config, "usage", timeout=60).stdout
+    m = re.search(r"Current balance:\s*([0-9.]+)", out)
+    if not m:
+        raise Unavailable("could not read the compute-unit balance")
+    return float(m.group(1))
 
 
 def run(job):
+    worth_colab(job)
+    if read_int(STATE / "cooldown") > time.time():
+        raise Unavailable("a Colab VM failed to start in the last 10 minutes")
     JOBS.mkdir(parents=True, exist_ok=True)
+    (STATE / "tmp").mkdir(exist_ok=True)
     short = re.sub(r"[^a-z0-9]", "", job["repository"].split("/")[1].lower())[:16] or "repo"
-    name = f"ci-{short}-{job['run_label']}-{secrets.token_hex(2)}"
+    name = f"ci-{short}-{job['run_label']}-{secrets.token_hex(3)}"
     home = JOBS / name
     home.mkdir(mode=0o700)
     config = home / "sessions.json"
     deadline = time.time() + job["timeout_minutes"] * 60
-    (home / "deadline").write_text(str(int(deadline + 600)))
-
+    write_atomic(home / "deadline", str(int(deadline + 600)))
     try:
-        cooldown = STATE / "cooldown"
-        if cooldown.exists() and int(cooldown.read_text()) > time.time():
-            raise Unavailable("a Colab VM failed to start in the last 10 minutes")
         units = balance(config)
         if units < MIN_BALANCE:
-            raise Unavailable(
-                f"{units:.1f} compute units left, below the {MIN_BALANCE:.0f} floor")
+            raise Unavailable(f"{units:.1f} compute units left, under the {MIN_BALANCE:.0f} floor")
         slot = take_slot()
-    except Unavailable:
+    except BaseException:
         shutil.rmtree(home, ignore_errors=True)
         raise
+
     started = time.monotonic()
     try:
-        (home / "hash").write_text(str(uuid.uuid4()))
-        (home / "gpu").write_text(job["gpu"])
+        write_atomic(home / "hash", str(uuid.uuid4()))
+        write_atomic(home / "gpu", job["gpu"])
+        # Marked before the start: if we give up or are cancelled during it, the server may
+        # still place the VM, and the reaper releases it by hash.
+        write_atomic(home / "late", str(int(time.time()) + LATE_VM_GRACE))
         try:
             vm(home, "new", str(home / "hash"), str(config), name, job["gpu"],
                timeout=NEW_TIMEOUT)
-        except Unavailable:
-            # The server may still place the VM after we gave up; the reaper releases it.
-            (home / "late").write_text(str(int(time.time()) + LATE_VM_GRACE))
-            (STATE / "cooldown").write_text(str(int(time.time()) + COOLDOWN))
-            raise
+        except Unavailable as error:
+            write_atomic(STATE / "cooldown", str(int(time.time()) + COOLDOWN))
+            raise Unavailable(f"no {job['gpu']} VM free right now ({error})") from None
+        (home / "late").unlink(missing_ok=True)
         log(f"{job['gpu']} VM ready in {time.monotonic() - started:.0f}s "
             f"({units:.1f} compute units left)")
+
         env_lines = [f"{k.upper()}={shlex.quote(job[k])}" for k in (
             "repository", "sha", "working_directory", "uv_version", "node_version",
             "bun_version")]
         files = {"job.env": "\n".join(env_lines) + "\n", "command": job["command"],
                  "token": job["token"], "vm-job.sh": Path(VM_SCRIPT).read_text()}
         payload = base64.b64encode(json.dumps(files).encode()).decode()
-        marked(py(config, name, START.format(files=payload)))
+        pid = int(marked(py(config, name, START.format(files=payload))))
 
         offset, failures, status = 0, 0, ""
         while True:
+            check_parent()
             if time.time() > deadline:
                 log(f"the command ran past {job['timeout_minutes']} minutes; stopping it")
                 return 124
             try:
-                chunk = marked(py(config, name, POLL.format(offset=offset), attempts=1))
+                chunk = marked(py(config, name, POLL.format(pid=pid, offset=offset),
+                                  attempts=1))
                 failures = 0
             except (Unavailable, json.JSONDecodeError) as error:
                 failures += 1
-                if failures >= 6:
+                if failures >= 4:
                     raise Unavailable(f"lost the VM: {error}") from None
                 restart_kernel(config, name)
                 time.sleep(5)
@@ -279,11 +431,13 @@ def run(job):
             if chunk["s"]:
                 status = chunk["s"]
                 break
+            if not chunk["alive"]:
+                raise Unavailable("the job died on the VM without an exit code")
             time.sleep(8)
 
-        code = int(status) if status.lstrip("-").isdigit() else UNAVAILABLE
-        if code == UNAVAILABLE:
+        if status == "setup":
             raise Unavailable("the VM could not set up the job")
+        code = int(status) if status.lstrip("-").isdigit() else 1
         if job["report"]:
             found = marked(py(config, name, REPORT.format(path=job["report"])))
             if found["ok"]:
@@ -294,21 +448,13 @@ def run(job):
         log(f"done in {time.monotonic() - started:.0f}s, exit {code}")
         return code
     finally:
-        stop(config, name, home)
-        slot.close()
-
-
-def vm(home, *args, timeout=60):
-    """Run colab_vm.py (start or release the VM of this job's notebook hash)."""
-    try:
-        r = subprocess.run([VENV_PYTHON, COLAB_VM, *args], env=ENV, capture_output=True,
-                           text=True, timeout=timeout, stdin=subprocess.DEVNULL, cwd=home)
-    except subprocess.TimeoutExpired:
-        raise Unavailable(f"`colab_vm.py {args[0]}` timed out after {timeout}s") from None
-    if r.returncode != 0:
-        tail = redact((r.stderr or r.stdout).strip())[-600:]
-        raise Unavailable(f"`colab_vm.py {args[0]}` failed ({r.returncode}): {tail}")
-    return r.stdout
+        seconds = int(time.monotonic() - started)
+        try:
+            stop(config, name, home)
+        finally:
+            slot.close()
+            with_stats(job["repository"], lambda d: d["vm_seconds"].__setitem__(
+                today(), d["vm_seconds"].get(today(), 0) + seconds))
 
 
 def stop(config, name, home):
@@ -318,7 +464,7 @@ def stop(config, name, home):
     except Unavailable as error:
         log(f"`colab stop` did not answer ({error}); releasing by notebook hash")
     # The CLI keeps every cell it sent, the job token included, in a local history file.
-    (STATE / ".config/colab-cli/history" / f"{name}.jsonl").unlink(missing_ok=True)
+    (HISTORY / f"{name}.jsonl").unlink(missing_ok=True)
     if not (home / "hash").exists():
         shutil.rmtree(home, ignore_errors=True)
         return True
@@ -335,8 +481,7 @@ def stop(config, name, home):
     except Unavailable as error:
         log(f"could not confirm {name} is stopped ({error}); the reaper will retry")
         return False
-    late = home / "late"
-    if late.exists() and int(late.read_text()) > time.time():
+    if read_int(home / "late") > time.time():
         return False  # a VM can still appear for this hash; the reaper looks again later
     shutil.rmtree(home, ignore_errors=True)
     return True
@@ -346,17 +491,22 @@ def reap():
     now = time.time()
     for home in sorted(JOBS.glob("ci-*")):
         try:
-            due = int((home / "deadline").read_text())
-        except (OSError, ValueError):
-            due = int(home.stat().st_mtime) + 7200
-        late = home / "late"
-        if late.exists():
-            due = min(due, int(late.read_text()))
-        if due < now:
-            log(f"reaping {home.name}")
-            if late.exists():
-                late.unlink()
-            stop(home / "sessions.json", home.name, home)
+            due = read_int(home / "deadline", int(home.stat().st_mtime) + 7200)
+            if (home / "late").exists():
+                due = min(due, read_int(home / "late"))
+            if due < now:
+                log(f"reaping {home.name}")
+                (home / "late").unlink(missing_ok=True)
+                stop(home / "sessions.json", home.name, home)
+        except Exception as error:  # noqa: BLE001 - one bad folder must not stop the sweep
+            log(f"could not reap {home.name}: {redact(repr(error))[-300:]}")
+    for path in [STATE / ".config/colab-cli/colab.log", *HISTORY.glob("*.jsonl"),
+                 *(STATE / "tmp").glob("*")]:
+        try:
+            if path.stat().st_size > 50_000_000 or path.stat().st_mtime < now - 86400:
+                path.unlink()
+        except OSError:
+            pass
 
 
 def main():
@@ -364,23 +514,26 @@ def main():
         reap()
         return 0
     if sys.argv[1:]:
-        log("takes a JSON job on stdin and no arguments")
+        log("takes a JSON message on stdin and no arguments")
         return 2
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(UNAVAILABLE))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(CANCELLED))
     try:
-        job = validate(json.load(sys.stdin))
-    except (ValueError, json.JSONDecodeError) as error:
-        log(f"rejected the job: {error}")
-        return 2
-    try:
-        return run(job)
+        repository = own_repository()
+        if not repository:
+            raise Unavailable("this runner is not registered for Colab (rerun colab/install.sh)")
+        spec = json.loads(sys.stdin.read(1_000_000))
+        if not isinstance(spec, dict):
+            raise Unavailable("the message is not a JSON object")
+        if "record" in spec:
+            return record(repository, spec)
+        return run(validate(spec, repository))
     except Unavailable as error:
-        log(f"Colab unavailable, the runner takes the job: {error}")
+        log(f"runs on the runner: {error}")
         return UNAVAILABLE
-    except KeyboardInterrupt:
-        return 130
+    except (Cancelled, KeyboardInterrupt):
+        return CANCELLED
     except Exception as error:  # noqa: BLE001 - a broker bug must not fail the project's check
-        log(f"broker error, the runner takes the job: {redact(repr(error))[-400:]}")
+        log(f"runs on the runner: broker error {redact(repr(error))[-400:]}")
         return UNAVAILABLE
 
 

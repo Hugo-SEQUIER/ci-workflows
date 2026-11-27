@@ -27,6 +27,23 @@ install -D -o root -g root -m 755 colab-ci-run /usr/local/bin/colab-ci-run
 install -D -o root -g root -m 644 vm-job.sh /usr/local/lib/colab-ci/vm-job.sh
 install -D -o root -g root -m 644 colab_vm.py /usr/local/lib/colab-ci/colab_vm.py
 
+# Which repository each runner user may send jobs for, read from its runner registration.
+install -d -o root -g colabci -m 750 /etc/colab-ci
+runners=$(mktemp)
+/usr/bin/python3 - "$runners" <<'EOF'
+import glob, json, sys
+found = {}
+for path in glob.glob("/home/gha-*/runner/.runner"):
+    url = json.load(open(path, encoding="utf-8-sig")).get("gitHubUrl", "")
+    user = path.split("/")[2]
+    if url.startswith("https://github.com/") and url.count("/") == 4:
+        found[user] = url.removeprefix("https://github.com/")
+json.dump(found, open(sys.argv[1], "w"), indent=1, sort_keys=True)
+print(f"{len(found)} runners registered for Colab")
+EOF
+install -o root -g colabci -m 640 "$runners" /etc/colab-ci/runners.json
+rm -f "$runners"
+
 sudoers=$(mktemp)
 cat > "$sudoers" <<'EOF'
 # Runner users may start the Colab check broker as colabci, with no arguments (job on stdin).

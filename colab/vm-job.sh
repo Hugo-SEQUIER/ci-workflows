@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs on the Colab VM, started by colab-ci-run. Clones the commit, installs the toolchains the
 # caller asked for (the same ones check.yml installs on a runner) and runs the check command.
-# Writes the command's exit code to /content/ci/status, or 75 when setup failed.
+# Writes the command's exit code to /content/ci/status, or "setup" when setup failed.
 set -uo pipefail
 cd /content/ci
 # shellcheck disable=SC1091
@@ -9,8 +9,8 @@ source ./job.env
 
 fail_setup() {
   echo "colab-ci: setup failed: $1"
-  echo 75 > /content/ci/status
-  exit 75
+  echo setup > /content/ci/status
+  exit 1
 }
 step() { echo "colab-ci: $1 ($SECONDS s)"; }
 
