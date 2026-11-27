@@ -79,7 +79,7 @@ jobs:
           TOKEN: ${{ github.token }}
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          if [ ! -x /usr/local/bin/colab-ci-run ] || ! sudo -n -l -u colabci /usr/local/bin/colab-ci-run "" >/dev/null 2>&1; then
+          if [ ! -x /usr/local/bin/colab-ci-run ] || ! sudo -n -l -u colabci /usr/local/bin/colab-ci-run >/dev/null 2>&1; then
             echo "This runner has no Colab access; the check runs here."
             echo "ran=false" >> "$GITHUB_OUTPUT"
             exit 0
