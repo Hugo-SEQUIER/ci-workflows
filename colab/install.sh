@@ -19,15 +19,13 @@ for user in $(getent passwd | cut -d: -f1 | grep '^gha-'); do
 done
 
 UV=$(command -v uv || echo /root/.local/bin/uv)
-if [ ! -x /opt/colab-ci/venv/bin/colab ] || \
-   ! /opt/colab-ci/venv/bin/colab version | grep -q "$CLI_VERSION"; then
-  "$UV" venv --quiet --python 3.12 /opt/colab-ci/venv
-  VIRTUAL_ENV=/opt/colab-ci/venv "$UV" pip install --quiet \
-    "google-colab-cli==$CLI_VERSION" "keyrings.alt==$KEYRINGS_ALT_VERSION"
-fi
+[ -x /opt/colab-ci/venv/bin/python ] || "$UV" venv --quiet --python 3.12 /opt/colab-ci/venv
+VIRTUAL_ENV=/opt/colab-ci/venv "$UV" pip install --quiet \
+  "google-colab-cli==$CLI_VERSION" "keyrings.alt==$KEYRINGS_ALT_VERSION"
 
 install -D -o root -g root -m 755 colab-ci-run /usr/local/bin/colab-ci-run
 install -D -o root -g root -m 644 vm-job.sh /usr/local/lib/colab-ci/vm-job.sh
+install -D -o root -g root -m 644 colab_vm.py /usr/local/lib/colab-ci/colab_vm.py
 
 sudoers=$(mktemp)
 cat > "$sudoers" <<'EOF'

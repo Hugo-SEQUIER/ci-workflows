@@ -25,10 +25,16 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 COLAB = "/opt/colab-ci/venv/bin/colab"
+VENV_PYTHON = "/opt/colab-ci/venv/bin/python"
+COLAB_VM = "/usr/local/lib/colab-ci/colab_vm.py"
 VM_SCRIPT = "/usr/local/lib/colab-ci/vm-job.sh"
+NEW_TIMEOUT = 150        # Colab can be slow to place a VM; past this the runner takes the job
+LATE_VM_GRACE = 300      # a killed start can still get a VM this long after; the reaper checks
+COOLDOWN = 600           # after a VM fails to start, jobs go straight to the runner this long
 STATE = Path("/var/lib/colab-ci")
 JOBS = STATE / "jobs"
 SLOTS = STATE / "slots"
@@ -176,6 +182,9 @@ def run(job):
     (home / "deadline").write_text(str(int(deadline + 600)))
 
     try:
+        cooldown = STATE / "cooldown"
+        if cooldown.exists() and int(cooldown.read_text()) > time.time():
+            raise Unavailable("a Colab VM failed to start in the last 10 minutes")
         units = balance(config)
         if units < MIN_BALANCE:
             raise Unavailable(
@@ -186,8 +195,16 @@ def run(job):
         raise
     started = time.monotonic()
     try:
-        flags = [] if job["gpu"] == "CPU" else ["--gpu", job["gpu"]]
-        colab(config, "new", "-s", name, *flags, timeout=180)
+        (home / "hash").write_text(str(uuid.uuid4()))
+        (home / "gpu").write_text(job["gpu"])
+        try:
+            vm(home, "new", str(home / "hash"), str(config), name, job["gpu"],
+               timeout=NEW_TIMEOUT)
+        except Unavailable:
+            # The server may still place the VM after we gave up; the reaper releases it.
+            (home / "late").write_text(str(int(time.time()) + LATE_VM_GRACE))
+            (STATE / "cooldown").write_text(str(int(time.time()) + COOLDOWN))
+            raise
         log(f"{job['gpu']} VM ready in {time.monotonic() - started:.0f}s "
             f"({units:.1f} compute units left)")
         py(config, name, "import os; os.makedirs('/content/ci', exist_ok=True)")
@@ -253,16 +270,44 @@ def run(job):
         slot.close()
 
 
+def vm(home, *args, timeout=60):
+    """Run colab_vm.py (start or release the VM of this job's notebook hash)."""
+    try:
+        r = subprocess.run([VENV_PYTHON, COLAB_VM, *args], env=ENV, capture_output=True,
+                           text=True, timeout=timeout, stdin=subprocess.DEVNULL, cwd=home)
+    except subprocess.TimeoutExpired:
+        raise Unavailable(f"`colab_vm.py {args[0]}` timed out after {timeout}s") from None
+    if r.returncode != 0:
+        tail = redact((r.stderr or r.stdout).strip())[-600:]
+        raise Unavailable(f"`colab_vm.py {args[0]}` failed ({r.returncode}): {tail}")
+    return r.stdout
+
+
 def stop(config, name, home):
+    """Stop this job's VM; remove its folder once Colab confirms no VM is left for its hash."""
     try:
         colab(config, "stop", "-s", name, timeout=90, check=False)
-        listed = colab(config, "sessions", timeout=60, check=False).stdout
-        if f"[{name}]" in listed:
-            log(f"session {name} is still listed; the reaper will retry")
+    except Unavailable as error:
+        log(f"`colab stop` did not answer ({error}); releasing by notebook hash")
+    if not (home / "hash").exists():
+        shutil.rmtree(home, ignore_errors=True)
+        return True
+    gpu = (home / "gpu").read_text().strip() if (home / "gpu").exists() else "L4"
+    try:
+        for _ in range(3):
+            out = vm(home, "release", str(home / "hash"), gpu)
+            if "no VM" in out:
+                break
+            log(f"released a VM left for {name}")
+        else:
+            log(f"{name} still has a VM; the reaper will retry")
             return False
     except Unavailable as error:
-        log(f"stop failed: {error}; the reaper will retry")
+        log(f"could not confirm {name} is stopped ({error}); the reaper will retry")
         return False
+    late = home / "late"
+    if late.exists() and int(late.read_text()) > time.time():
+        return False  # a VM can still appear for this hash; the reaper looks again later
     shutil.rmtree(home, ignore_errors=True)
     return True
 
@@ -274,8 +319,13 @@ def reap():
             due = int((home / "deadline").read_text())
         except (OSError, ValueError):
             due = int(home.stat().st_mtime) + 7200
+        late = home / "late"
+        if late.exists():
+            due = min(due, int(late.read_text()))
         if due < now:
             log(f"reaping {home.name}")
+            if late.exists():
+                late.unlink()
             stop(home / "sessions.json", home.name, home)
 
 
